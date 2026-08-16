@@ -1,0 +1,18 @@
+# 构建产物
+build/
+*.o
+
+# 第三方闭源 SDK（不随仓库分发，按 README 放置到该目录）
+/R3DSDKv9_2_1/
+
+# 归档/测试输出产物
+*.h265.mov
+*.h265.mov.part
+*.sidecar.json
+*.sidecar.json.part
+ref.yuv
+dec.yuv
+*.yuv
+
+# macOS
+.DS_Store
