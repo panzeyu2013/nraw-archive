@@ -111,7 +111,7 @@ nraw-archive [options] input.NEV [output.mov]
 | `--no-sidecar` | 不写 sidecar JSON | 关 |
 | `--dump-ref <file>` | 输出无损 yuv420p10le 参考帧（测试专用；auto 模式自动走 CPU 路径，跳过 GPU 探测/门控/内核编译） | 关 |
 | `--sdk-path <dir>` | SDK .so 目录 | 可执行文件所在目录 |
-| `--gpu-test` | 测试 GPU 路径后退出：OpenCL 初始化 + 内核编译状态 + A/B 门控（退出码 0=可用，2=初始化失败，4=门控失败） | |
+| `--gpu-test` | 测试 GPU 路径后退出：OpenCL 初始化 + 内核编译状态 + A/B 门控（退出码 0=可用，2=初始化失败，4=门控失败）。无输入文件时仅测初始化 + 内核编译 | |
 | `--version` | 显示版本号后退出 | |
 | `--help` | 显示帮助后退出 | |
 
@@ -120,7 +120,7 @@ nraw-archive [options] input.NEV [output.mov]
 - `xxx.h265.mov`：HEVC Main10 4:2:0 10bit，crf 14，matrix=BT.2020、full range，音频 pcm_s24le。**写入是原子的**：先写 `xxx.h265.mov.part`，成功后 rename 替换，失败/中断不破坏已有归档。
 - `xxx.h265.mov.sidecar.json`：sha256（源文件，内置 SHA-256 实现计算，不依赖外部 sha256sum）、色彩空间 RWG/Log3G10、matrix BT.2020 full range、镜头矫正状态、解码路径（`decode_path: gpu|cpu`，含 `gpu_device` 与 A/B 门控最低 PSNR `gate_psnr_db`）、编码参数（crf/preset/keyint 等）、clip 元数据。
 
-退出码：0 成功；1 参数错误；2 SDK/媒体打开失败（含 `--decode gpu` 强制模式下的 GPU 不可用）；4 处理失败（编码/写入/GPU 管线中断）；5 sidecar 写入失败。`--gpu-test` 模式下：0 = GPU 可用（初始化+门控通过），2 = GPU 初始化失败，4 = A/B 门控未达标或未能执行。SIGINT/SIGTERM 时清理部分产物后以 130 退出。
+退出码：0 成功；1 参数错误；2 SDK/媒体打开失败（含 `--decode gpu` 强制模式下的 GPU 不可用）；4 处理失败（编码/写入/GPU 管线中断）；5 sidecar 写入失败。`--gpu-test` 模式下：0 = GPU 可用（初始化+门控通过），2 = GPU 初始化失败，4 = A/B 门控未达标或未能执行；`--gpu-test` 无输入文件时（仅初始化+内核编译）：0 = 初始化通过，2 = 初始化失败。SIGINT/SIGTERM 时清理部分产物后以 130 退出。
 
 处理过程中每 2 秒刷新一行进度：进度条 + 百分比 + 已处理/总时长 + 剩余时长 + 预计结束时间（墙钟）+ 实际 fps。
 

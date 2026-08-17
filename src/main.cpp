@@ -201,7 +201,7 @@ void printHelp()
     printf("  --no-sidecar            不生成 .sidecar.json\n");
     printf("  --dump-ref <file>       输出 YUV420P10LE 参考数据后退出 (测试用)\n");
     printf("  --sdk-path <dir>        包含 RED*.so 的目录 (默认程序所在目录)\n");
-    printf("  --gpu-test              测试 GPU 路径: 初始化+内核编译状态+A/B 门控, 然后退出\n");
+    printf("  --gpu-test              测试 GPU 路径后退出; 无输入文件时仅测初始化+内核编译\n");
     printf("  --version               显示版本号\n");
     printf("  --help                  显示本帮助\n");
 }
@@ -420,7 +420,7 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
     std::vector<std::string> pos;
     for (int i = optind; i < argc; ++i)
         pos.push_back(argv[i]);
-    if (pos.empty()) {
+    if (pos.empty() && !opt.gpuTest) {
         fprintf(stderr, "缺少输入文件\n");
         return 1;
     }
@@ -428,7 +428,8 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         fprintf(stderr, "参数过多\n");
         return 1;
     }
-    opt.input = pos[0];
+    if (!pos.empty())
+        opt.input = pos[0];
     if (pos.size() > 1)
         opt.output = pos[1];
     return 0;
@@ -941,9 +942,31 @@ int main(int argc, char** argv)
     }
 
     std::string err;
-    if (!nraw::initSdk(opt.sdkPath, err, opt.decodeMode == 1)) {
+    // auto(0)/gpu(1) 模式都需加载 REDOpenCL 组件（GPU 路径 REDCL 依赖它）；
+    // 仅纯 CPU 模式（--decode cpu, 2）不加载
+    if (!nraw::initSdk(opt.sdkPath, err, opt.decodeMode != 2)) {
         fprintf(stderr, "initSdk 失败: %s\n", err.c_str());
         return 2;
+    }
+
+    // --gpu-test 无输入文件模式：只做 GPU 初始化（OpenCL 加载/枚举 + REDCL
+    // 内核编译），不打开剪辑、不做 A/B 门控。退出码 0 = 初始化通过，2 = 失败。
+    if (opt.gpuTest && opt.input.empty()) {
+        nraw::GpuPipeline gpu;
+        std::string gerr;
+        printf("GPU 测试（无输入文件模式）: 仅初始化 OpenCL + REDCL + 内核编译\n");
+        fflush(stdout);
+        if (!gpu.initGpuOnly(gerr)) {
+            fprintf(stderr, "GPU 初始化失败: %s\n", gerr.c_str());
+            gpu.close();
+            nraw::shutdownSdk();
+            return 2;
+        }
+        printf("GPU 测试结果: 通过（设备 %s，初始化 + 内核编译完成）\n",
+               gpu.deviceName().c_str());
+        gpu.close();
+        nraw::shutdownSdk();
+        return 0;
     }
 
     nraw::MediaInfo info;

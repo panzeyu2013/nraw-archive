@@ -115,7 +115,7 @@ Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sideca
 | `--no-sidecar` | don't write the sidecar JSON | off |
 | `--dump-ref <file>` | write lossless yuv420p10le reference frames (testing; auto mode skips the GPU probe/gate and uses the CPU path) | off |
 | `--sdk-path <dir>` | directory containing the RED*.so runtime libraries | executable directory |
-| `--gpu-test` | test the GPU path and exit: OpenCL init + kernel compile status + A/B gate (exit 0 = usable, 2 = init failed, 4 = gate failed) | |
+| `--gpu-test` | test the GPU path and exit: OpenCL init + kernel compile status + A/B gate (exit 0 = usable, 2 = init failed, 4 = gate failed). Without an input file, only init + kernel compile are tested | |
 | `--version` | print version and exit | |
 | `--help` | print help and exit | |
 
@@ -124,7 +124,7 @@ Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sideca
 - `xxx.h265.mov` — HEVC Main10 4:2:0 10-bit, crf 14, matrix=BT.2020, full range, `pcm_s24le` audio. **Writes are atomic**: the file is written as `xxx.h265.mov.part` and renamed over the target on success; failures/interrupts never corrupt an existing archive.
 - `xxx.h265.mov.sidecar.json` — sha256 of the source (computed with a built-in SHA-256 implementation, no external `sha256sum` dependency), color space RWG/Log3G10, matrix BT.2020 full range, lens-correction state, decode path (`decode_path: gpu|cpu`, with `gpu_device` and the A/B gate minimum PSNR `gate_psnr_db`), encode parameters (crf/preset/keyint/etc.), and clip metadata.
 
-**Exit codes:** 0 success; 1 bad arguments; 2 SDK/media open failure (including forced-GPU unavailable with `--decode gpu`); 4 processing failure (encode/write/GPU pipeline); 5 sidecar write failure. With `--gpu-test`: 0 = GPU path usable (init + gate passed), 2 = GPU initialization failed, 4 = A/B gate failed or could not run. SIGINT/SIGTERM removes partial artifacts and exits 130.
+**Exit codes:** 0 success; 1 bad arguments; 2 SDK/media open failure (including forced-GPU unavailable with `--decode gpu`); 4 processing failure (encode/write/GPU pipeline); 5 sidecar write failure. With `--gpu-test`: 0 = GPU path usable (init + gate passed), 2 = GPU initialization failed, 4 = A/B gate failed or could not run. With `--gpu-test` and **no input file** (init + kernel compile only): 0 = init passed, 2 = init failed. SIGINT/SIGTERM removes partial artifacts and exits 130.
 
 During processing a progress line is printed every 2 s showing a progress bar, percent, processed/total media duration, remaining duration, estimated wall-clock finish time, and actual fps.
 

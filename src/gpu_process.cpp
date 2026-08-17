@@ -278,6 +278,9 @@ public:
     ~GpuPipelineImpl() { close(); }
 
     bool init(const CliOptions& opt, const MediaInfo& info, std::string& err);
+    // 无素材 GPU 测试：仅 OpenCL 加载/设备枚举 + REDCL 构造 + 内核编译，
+    // 不打开剪辑、不分配缓冲（--gpu-test 无输入文件模式）
+    bool initGpuOnly(std::string& err);
     bool decodeSync(size_t frameNo, VideoFrame& out, std::string& err);
     bool start(FrameQueue& frames, std::atomic<bool>* abort, std::string& err);
     bool submit(size_t frameNo, std::string& err);
@@ -320,6 +323,10 @@ private:
     void worker();
     void setFail(const std::string& msg);
 
+    // OpenCL 加载 + 符号绑定 + 平台/设备枚举 + REDCL 构造 + 兼容性检查（内核编译）。
+    // 不依赖任何输入素材，供 init() 与 initGpuOnly() 共用。
+    bool initOpenCL(std::string& err);
+
     void* clHandle_ = nullptr;
     R3DSDK::EXT_OCLAPI_1_1 ocl_;
     ClEngine cl_;
@@ -357,8 +364,10 @@ private:
     std::string deviceName_;
 };
 
-bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::string& err)
+bool GpuPipelineImpl::initOpenCL(std::string& err)
 {
+    printf("  [1/4] 加载 libOpenCL...\n");
+    fflush(stdout);
     const char* envLib = getenv("NRAW_OPENCL_LIB");
     clHandle_ = envLib && *envLib ? dlopen(envLib, RTLD_NOW | RTLD_LOCAL) : nullptr;
     if (!clHandle_)
@@ -373,11 +382,15 @@ bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::st
         err = "libOpenCL 缺少所需符号，版本过旧";
         return false;
     }
+    printf("  [2/4] 枚举 OpenCL GPU 设备并创建上下文...\n");
+    fflush(stdout);
     if (!cl_.init(ocl_, deviceName_, err))
         return false;
 
     std::string cacheErr;
     std::string cacheDir = openclCacheDir(cacheErr);
+    printf("  [3/4] 创建 REDCL（加载 REDOpenCL-x64.so）...\n");
+    fflush(stdout);
     try {
         redcl_ = new R3DSDK::REDCL(ocl_, cacheDir.c_str());
     } catch (const std::exception& e) {
@@ -392,7 +405,7 @@ bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::st
         printf("OpenCL 内核缓存: 禁用（%s）\n", cacheErr.empty() ? "无缓存目录" : cacheErr.c_str());
     else
         printf("OpenCL 内核缓存: %s\n", cacheDir.c_str());
-    printf("正在检查 GPU 兼容性并编译内核（首次可能需数分钟）...\n");
+    printf("  [4/4] 编译 OpenCL 内核（首次可能需数分钟）...\n");
     fflush(stdout);
     cl_int ce = 0;
     R3DSDK::REDCL::Status st = redcl_->checkCompatibility(cl_.context(), cl_.queue(), ce);
@@ -403,7 +416,20 @@ bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::st
             err += "（无法加载 REDOpenCL 动态库：请确认 REDOpenCL-x64.so 与可执行文件同目录或 --sdk-path 指向正确）";
         return false;
     }
+    return true;
+}
 
+bool GpuPipelineImpl::initGpuOnly(std::string& err)
+{
+    return initOpenCL(err);
+}
+
+bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::string& err)
+{
+    if (!initOpenCL(err))
+        return false;
+
+    cl_int ce = 0;
     try {
         clip_ = new R3DSDK::Clip(opt.input.c_str());
     } catch (const std::bad_alloc&) {
@@ -885,6 +911,11 @@ GpuPipeline::~GpuPipeline()
 bool GpuPipeline::init(const CliOptions& opt, const MediaInfo& info, std::string& err)
 {
     return static_cast<GpuPipelineImpl*>(impl_)->init(opt, info, err);
+}
+
+bool GpuPipeline::initGpuOnly(std::string& err)
+{
+    return static_cast<GpuPipelineImpl*>(impl_)->initGpuOnly(err);
 }
 
 bool GpuPipeline::decodeSync(size_t frameNo, VideoFrame& out, std::string& err)

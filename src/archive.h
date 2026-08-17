@@ -326,6 +326,9 @@ public:
 
     // OpenCL load + REDCL init + compatibility check (long on first run)
     bool init(const CliOptions& opt, const MediaInfo& info, std::string& err);
+    // 无素材 GPU 初始化测试：OpenCL 加载/枚举 + REDCL 构造 + 内核编译，
+    // 不依赖输入文件（供 --gpu-test 无输入模式使用）
+    bool initGpuOnly(std::string& err);
     // synchronous single-frame decode, used by the A/B gate (before start())
     bool decodeSync(size_t frameNo, VideoFrame& out, std::string& err);
     // start AsyncDecoder + worker thread; frames is the ordered encoder queue;
