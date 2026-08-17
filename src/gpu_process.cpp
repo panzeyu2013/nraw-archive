@@ -308,18 +308,33 @@ private:
         R3DSDK::AsyncDecompressJob job;
         CbData cb;
         bool abandoned = false;
+        // 多帧在途（processAsync 流水线）要求每帧独立 GPU 缓冲：
+        cl_mem rawDev = nullptr;   // GPU 端 raw 缓冲（init 时创建）
+        cl_mem outDev = nullptr;   // GPU 端输出缓冲（首次 debayer 时按需创建）
+        AlignedBuffer outHost;     // 回读缓冲
+        size_t outSize = 0;
     };
     struct ReadyJob {
         Slot* slot = nullptr;
         size_t frameNo = 0;
         R3DSDK::DecodeStatus status = R3DSDK::DSDecodeOK;
     };
+    // 已提交 processAsync、等待 completeAsync 的帧（worker 线程独占，无需锁）
+    struct Inflight {
+        Slot* slot = nullptr;
+        R3DSDK::DebayerOpenCLJob* job = nullptr;
+        size_t frameNo = 0;
+    };
 
     static void asyncCb(R3DSDK::AsyncDecompressJob* item, R3DSDK::DecodeStatus st);
 
     Slot* acquire();
     void release(Slot* s);
-    bool debayer(Slot* s, VideoFrame& out, std::string& err);
+    // 异步 debayer 流水线两段：
+    //   debayerStart:   上传 raw + processAsync（不等待 GPU），帧进入 inflight_
+    //   debayerComplete: completeAsync（等该帧 GPU 完成）+ 回读 + planar 转换
+    bool debayerStart(Slot* s, std::string& err);
+    bool debayerComplete(Slot* s, VideoFrame& out, std::string& err);
     void worker();
     void setFail(const std::string& msg);
 
@@ -338,12 +353,12 @@ private:
     size_t width_ = 0;
     size_t height_ = 0;
     size_t frameCount_ = 0;
-    size_t outSize_ = 0;
-    cl_mem rawDev_ = nullptr;
-    cl_mem outDev_ = nullptr;
-    AlignedBuffer outHost_;
+    // GPU 端同时在途（已提交未完成）的 debayer 帧上限；kInFlight 个 raw slot
+    // 中最多 kMaxInflight 个处于 GPU 流水线，其余在 ready_/free 流转
+    static constexpr size_t kMaxInflight = 6;
 
     std::vector<Slot> slots_;
+    std::deque<Inflight> inflight_;   // FIFO：保序 complete（frames_ 要求帧号递增）
     std::deque<Slot*> free_;
     std::mutex poolM_;
     std::condition_variable poolCv_;
@@ -476,13 +491,6 @@ bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::st
         return false;
     }
 
-    rawDev_ = cl_.ocl()->clCreateBuffer(cl_.context(), CL_MEM_READ_WRITE, rawSize,
-                                        nullptr, &ce);
-    if (!rawDev_ || ce != CL_SUCCESS) {
-        err = "GPU 原始缓冲分配失败 (clerr " + std::to_string(ce) + ")";
-        return false;
-    }
-
     try {
         slots_.resize(kInFlight);
     } catch (const std::bad_alloc&) {
@@ -496,6 +504,13 @@ bool GpuPipelineImpl::init(const CliOptions& opt, const MediaInfo& info, std::st
             return false;
         }
         s.rawSize = rawSize;
+        // 每帧独立 GPU raw 缓冲（processAsync 多帧在途必需）
+        s.rawDev = cl_.ocl()->clCreateBuffer(cl_.context(), CL_MEM_READ_WRITE,
+                                             rawSize, nullptr, &ce);
+        if (!s.rawDev || ce != CL_SUCCESS) {
+            err = "GPU 原始缓冲分配失败 (clerr " + std::to_string(ce) + ")";
+            return false;
+        }
         s.cb.pipe = this;
         s.cb.slot = &s;
         s.job.Clip = clip_;
@@ -585,7 +600,12 @@ bool GpuPipelineImpl::decodeSync(size_t frameNo, VideoFrame& out, std::string& e
         err = failMsg_;
         return false;
     }
-    bool ok = debayer(rj.slot, out, err);
+    std::string derr;
+    bool ok = debayerStart(rj.slot, derr);
+    if (ok)
+        ok = debayerComplete(rj.slot, out, derr);
+    if (!ok)
+        err = derr;
     release(rj.slot);
     if (!ok)
         setFail(err);
@@ -683,18 +703,28 @@ void GpuPipelineImpl::close()
         delete adec_;
         adec_ = nullptr;
     }
+    // 异常/失败路径可能残留未完成的 in-flight 帧：completeAsync 释放 SDK 资源
+    for (auto& ifl : inflight_) {
+        if (ifl.job && redcl_) {
+            ifl.job->completeAsync();
+            redcl_->releaseDebayerJob(ifl.job);
+        }
+    }
+    inflight_.clear();
     if (redcl_) {
         delete redcl_;
         redcl_ = nullptr;
     }
     if (cl_.ocl()) {
-        if (rawDev_) {
-            cl_.ocl()->clReleaseMemObject(rawDev_);
-            rawDev_ = nullptr;
-        }
-        if (outDev_) {
-            cl_.ocl()->clReleaseMemObject(outDev_);
-            outDev_ = nullptr;
+        for (auto& s : slots_) {
+            if (s.outDev) {
+                cl_.ocl()->clReleaseMemObject(s.outDev);
+                s.outDev = nullptr;
+            }
+            if (s.rawDev) {
+                cl_.ocl()->clReleaseMemObject(s.rawDev);
+                s.rawDev = nullptr;
+            }
         }
     }
     cl_.destroy();
@@ -724,10 +754,12 @@ void GpuPipelineImpl::release(Slot* s)
     poolCv_.notify_one();
 }
 
-bool GpuPipelineImpl::debayer(Slot* s, VideoFrame& out, std::string& err)
+bool GpuPipelineImpl::debayerStart(Slot* s, std::string& err)
 {
     R3DSDK::EXT_OCLAPI_1_1* ocl = cl_.ocl();
-    if (ocl->clEnqueueWriteBuffer(cl_.queue(), rawDev_, CL_TRUE, 0, s->rawSize,
+    // 上传用 CL_FALSE（异步入队）：同一 in-order 队列上 processAsync 会
+    // 在上传之后执行；raw 缓冲在 completeAsync 前不会释放，数据安全
+    if (ocl->clEnqueueWriteBuffer(cl_.queue(), s->rawDev, CL_FALSE, 0, s->rawSize,
                                   s->raw.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
         err = "raw 数据上传 GPU 失败";
         return false;
@@ -738,44 +770,66 @@ bool GpuPipelineImpl::debayer(Slot* s, VideoFrame& out, std::string& err)
         return false;
     }
     job->raw_host_mem = s->raw.data();
-    job->raw_device_mem = rawDev_;
+    job->raw_device_mem = s->rawDev;
     job->mode = R3DSDK::DECODE_FULL_RES_PREMIUM;
     job->imageProcessingSettings = ip_;
     job->pixelType = R3DSDK::PixelType_16Bit_RGB_Interleaved;
-    if (!outDev_) {
-        outSize_ = R3DSDK::DebayerOpenCLJob::ResultFrameSize(*job);
-        if (outSize_ == 0) {
+    if (!s->outDev) {
+        s->outSize = R3DSDK::DebayerOpenCLJob::ResultFrameSize(*job);
+        if (s->outSize == 0) {
             redcl_->releaseDebayerJob(job);
             err = "ResultFrameSize 返回 0（原始帧数据无效）";
             return false;
         }
         cl_int ce = 0;
-        outDev_ = ocl->clCreateBuffer(cl_.context(), CL_MEM_READ_WRITE, outSize_,
-                                      nullptr, &ce);
-        if (!outDev_ || ce != CL_SUCCESS) {
+        s->outDev = ocl->clCreateBuffer(cl_.context(), CL_MEM_READ_WRITE, s->outSize,
+                                        nullptr, &ce);
+        if (!s->outDev || ce != CL_SUCCESS) {
             redcl_->releaseDebayerJob(job);
             err = "GPU 输出缓冲分配失败 (clerr " + std::to_string(ce) + ")";
             return false;
         }
-        outHost_.resize(outSize_, 64);
-        if (!outHost_.data()) {
+        s->outHost.resize(s->outSize, 64);
+        if (!s->outHost.data()) {
             redcl_->releaseDebayerJob(job);
             err = "内存不足 (OOM)";
             return false;
         }
     }
-    job->output_device_mem_size = outSize_;
-    job->output_device_mem = outDev_;
+    job->output_device_mem_size = s->outSize;
+    job->output_device_mem = s->outDev;
     cl_int ce = 0;
-    R3DSDK::REDCL::Status st = redcl_->process(cl_.context(), cl_.queue(), job, ce);
-    redcl_->releaseDebayerJob(job);
+    // 异步提交：不等待 GPU，立即返回，帧进入 inflight_ 由 worker 保序 complete
+    R3DSDK::REDCL::Status st = redcl_->processAsync(cl_.context(), cl_.queue(), job, ce);
     if (st != R3DSDK::REDCL::Status_Ok) {
-        err = "REDCL 处理失败 (status " + std::to_string(static_cast<int>(st)) +
+        redcl_->releaseDebayerJob(job);
+        err = "REDCL 异步处理失败 (status " + std::to_string(static_cast<int>(st)) +
               ", clerr " + std::to_string(ce) + ")";
         return false;
     }
-    if (ocl->clEnqueueReadBuffer(cl_.queue(), outDev_, CL_TRUE, 0, outSize_,
-                                 outHost_.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+    inflight_.push_back(Inflight{s, job, s->cb.frameNo});
+    return true;
+}
+
+bool GpuPipelineImpl::debayerComplete(Slot* s, VideoFrame& out, std::string& err)
+{
+    // 从 inflight_ 取最旧帧完成（FIFO 保序：frames_ 要求帧号严格递增）
+    if (inflight_.empty()) {
+        err = "内部错误: inflight 队列为空";
+        return false;
+    }
+    Inflight ifl = inflight_.front();
+    if (ifl.slot != s) {
+        err = "内部错误: debayer 完成顺序错乱";
+        return false;
+    }
+    inflight_.pop_front();
+    R3DSDK::EXT_OCLAPI_1_1* ocl = cl_.ocl();
+    // 阻塞直到该帧的 GPU 工作（含上传与 REDCL 处理）完成，并释放 SDK 内部资源
+    ifl.job->completeAsync();
+    redcl_->releaseDebayerJob(ifl.job);
+    if (ocl->clEnqueueReadBuffer(cl_.queue(), s->outDev, CL_TRUE, 0, s->outSize,
+                                 s->outHost.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
         err = "GPU 结果回读失败";
         return false;
     }
@@ -792,7 +846,7 @@ bool GpuPipelineImpl::debayer(Slot* s, VideoFrame& out, std::string& err)
         err = "内存不足 (OOM)";
         return false;
     }
-    const uint16_t* src = static_cast<const uint16_t*>(outHost_.data());
+    const uint16_t* src = static_cast<const uint16_t*>(s->outHost.data());
     uint16_t* dst = static_cast<uint16_t*>(out.rgb.data());
     const size_t n = width_ * height_;
     for (size_t i = 0; i < n; ++i) {
@@ -807,29 +861,55 @@ void GpuPipelineImpl::worker()
 {
     size_t nextPush = 0;
     for (;;) {
+        // 阶段 A：把下一帧提交到 GPU（processAsync，不等待）。
+        // 正常时 inflight 保持 ≤ kMaxInflight；收尾（workerStop_）时允许超限，
+        // 把 ready_ 剩余帧全部提交后统一完成。
         ReadyJob rj;
+        bool got = false;
         {
             std::unique_lock<std::mutex> lk(readyM_);
-            readyCv_.wait(lk, [&] {
-                return workerStop_ ||
-                       (!ready_.empty() && ready_.begin()->first == nextPush);
-            });
-            if (ready_.empty())
-                break;
-            if (ready_.begin()->first != nextPush)
-                continue;
-            auto it = ready_.begin();
-            rj = std::move(it->second);
-            ready_.erase(it);
+            if (!ready_.empty() && ready_.begin()->first == nextPush &&
+                (inflight_.size() < kMaxInflight || workerStop_)) {
+                auto it = ready_.begin();
+                rj = std::move(it->second);
+                ready_.erase(it);
+                got = true;
+            }
         }
-        ++nextPush;
-        if (rj.status != R3DSDK::DSDecodeOK) {
-            setFail("异步解码失败 (status " + std::to_string(static_cast<int>(rj.status)) +
-                    ") at frame " + std::to_string(rj.frameNo));
-        } else {
+        if (got) {
+            if (rj.status != R3DSDK::DSDecodeOK) {
+                setFail("异步解码失败 (status " +
+                        std::to_string(static_cast<int>(rj.status)) +
+                        ") at frame " + std::to_string(rj.frameNo));
+                ++nextPush;
+                release(rj.slot);
+                {
+                    std::lock_guard<std::mutex> lk(readyM_);
+                    --outstanding_;
+                }
+                doneCv_.notify_all();
+                continue;
+            }
+            std::string err;
+            if (!debayerStart(rj.slot, err)) {
+                setFail(err);
+                ++nextPush;
+                release(rj.slot);
+                {
+                    std::lock_guard<std::mutex> lk(readyM_);
+                    --outstanding_;
+                }
+                doneCv_.notify_all();
+                continue;
+            }
+            continue;  // 已入 inflight_，继续提交更多帧
+        }
+        // 阶段 B：完成最旧 inflight 帧（completeAsync + 回读 + push，保序）
+        if (!inflight_.empty()) {
+            Slot* slot = inflight_.front().slot;
             std::string err;
             VideoFrame f;
-            if (!debayer(rj.slot, f, err)) {
+            if (!debayerComplete(slot, f, err)) {
                 setFail(err);
             } else {
                 try {
@@ -838,13 +918,25 @@ void GpuPipelineImpl::worker()
                     setFail("内存不足 (OOM)");
                 }
             }
+            ++nextPush;
+            release(slot);
+            {
+                std::lock_guard<std::mutex> lk(readyM_);
+                --outstanding_;
+            }
+            doneCv_.notify_all();
+            continue;
         }
-        release(rj.slot);
+        // 阶段 C：无事可做——收尾退出，或等待 nextPush 帧解压完成
+        if (workerStop_)
+            break;
         {
-            std::lock_guard<std::mutex> lk(readyM_);
-            --outstanding_;
+            std::unique_lock<std::mutex> lk(readyM_);
+            readyCv_.wait(lk, [&] {
+                return workerStop_ ||
+                       (!ready_.empty() && ready_.begin()->first == nextPush);
+            });
         }
-        doneCv_.notify_all();
     }
 }
 
