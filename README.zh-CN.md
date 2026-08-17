@@ -1,6 +1,6 @@
 # nraw-archive — Nikon NRAW (.NEV) → HEVC 存档工具
 
-Nikon Z8/Z9 等 N-RAW（.NEV）→ 单文件 HEVC 归档工具。双解码路径：**GPU 主路径**（AsyncDecoder 多线程解压 + REDOpenCL GPU debayer/IPP2，无 GPU 或无 OpenCL 驱动时自动回退）与 **CPU 顺序路径**（SDK 同步解码）。零中间文件，SDK 解码与 x265 编码直接对接输出单个 MOV，附带 sidecar JSON 记录校验、元数据与解码路径（`decode_path: gpu/cpu`）。
+Nikon Z8/Z9 等 N-RAW（.NEV）→ 单文件 HEVC 归档工具。双解码路径：**GPU 主路径**（AsyncDecoder 多线程解压 + REDOpenCL GPU debayer/IPP2，无 GPU 或无 OpenCL 驱动时自动回退）与 **CPU 并行路径**（SDK 同步解码 + 多进程并行：实测 SDK 经典解码为进程内全局串行 ~1fps，故 --decode cpu 派生 N 个 worker 子进程经管道并行解码，实测约 5× 提速）。零中间文件，SDK 解码与 x265 编码直接对接输出单个 MOV，附带 sidecar JSON 记录校验、元数据与解码路径（`decode_path: gpu/cpu`）。
 
 > English → [README.md](README.md)
 
@@ -97,14 +97,16 @@ nraw-archive [options] input.NEV [output.mov]
 | `--exposure <stops>` | 曝光偏移（EV） | 相机元数据（as-shot） |
 | `--lens-correction auto\|on\|off` | 镜头（畸变）矫正 | on（auto 交由 SDK 判断） |
 | `--chroma-nr on\|off` | 色度降噪 | 相机默认（off） |
-| `--decode gpu\|cpu\|auto` | 解码路径：auto=GPU 探测 + A/B 门控（默认）；gpu=强制 GPU；cpu=纯 CPU | auto |
+| `--decode gpu\|cpu\|auto` | 解码路径：auto=GPU 探测 + A/B 门控（默认）；gpu=强制 GPU；cpu=纯 CPU（多进程并行，实测 ~5×） | auto |
 | `--crf <n>` | x265 恒定质量 | 14（建议 12–18） |
 | `--preset <p>` | x265 速度档 | slow |
 | `--keyint <n>` | GOP 长度 | auto（2 秒 × 帧率） |
 | `--min-keyint <n>` | 最小 GOP | 1 |
-| `--pools <n>` | x265 线程池 | 8（默认，减少线程扰动） |
+| `--pools <n>` | x265 编码线程池大小（仅编码；与解码 worker 相互独立） | auto（由 --jobs 统一分配） |
+| `--cpu-workers <n>` | CPU 解码 worker 进程数（每个约 ~1fps，N 个≈N fps） | auto（由 --jobs 分配，上限 8） |
+| `--jobs <n>` | CPU 总线程预算，自动拆分为解码 worker 数与 x265 pools（显式 --cpu-workers/--pools 优先） | auto（= 可用核心数） |
 | `--open-gop <0\|1>` | GOP 结构：1=open（场景切点 I 帧），0=closed（全 IDR，帧精确剪接更稳） | 1 |
-| `--buffers <n>` | 帧队列深度（GPU 路径使用；CPU 顺序路径不使用） | 16 |
+| `--buffers <n>` | 帧队列深度（GPU 路径使用；CPU 路径由管道背压控制） | 16 |
 | `--frames <n>` | 处理帧数上限（测试用） | 全部 |
 | `--no-audio` | 不封装音频 | 关 |
 | `--faststart` | moov 移到文件头 | 关 |

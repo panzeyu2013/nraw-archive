@@ -187,12 +187,14 @@ void printHelp()
     printf("  --exposure <stops>      曝光补偿, 单位档位 (默认 as-shot)\n");
     printf("  --lens-correction <auto|on|off>  镜头畸变校正 (默认 on)\n");
     printf("  --chroma-nr <on|off>    色度降噪 (默认=原始值 as-shot)\n");
-    printf("  --decode <gpu|cpu|auto> 解码路径: auto=GPU 探测+A/B 门控(默认), gpu=强制 GPU, cpu=纯 CPU\n");
+    printf("  --decode <gpu|cpu|auto> 解码路径: auto=GPU 探测+A/B 门控(默认), gpu=强制 GPU, cpu=纯 CPU(多进程并行)\n");
     printf("  --crf <N>               HEVC 质量 (默认 14)\n");
     printf("  --preset <name>         x265 预设 (默认 slow)\n");
     printf("  --keyint <N>            关键帧间隔 (默认 0=round(fps*2))\n");
     printf("  --min-keyint <N>        最小关键帧间隔 (默认 1)\n");
-    printf("  --pools <N>             x265 线程池大小 (默认 0=8)\n");
+    printf("  --pools <N>             x265 编码线程池大小 (默认 0=auto，由 --jobs 统一分配)\n");
+    printf("  --cpu-workers <N>       CPU 解码 worker 进程数 (默认 0=auto，每个约 ~1fps，8 个≈8fps)\n");
+    printf("  --jobs <N>              CPU 总线程预算 (默认 0=auto=核心数)；自动拆分 worker 数与 x265 pools\n");
     printf("  --open-gop <0|1>        GOP 结构: 1=open(场景切点,默认), 0=closed\n");
     printf("  --buffers <N>           帧队列深度 (默认 16)\n");
     printf("  --frames <N>            仅处理前 N 帧 (默认 -1=全部)\n");
@@ -221,6 +223,8 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         {"keyint",          required_argument, nullptr, 'k'},
         {"min-keyint",      required_argument, nullptr, 'm'},
         {"pools",           required_argument, nullptr, 'o'},
+        {"cpu-workers",     required_argument, nullptr, 'J'},
+        {"jobs",            required_argument, nullptr, 'j'},
         {"buffers",         required_argument, nullptr, 'b'},
         {"frames",          required_argument, nullptr, 'f'},
         {"open-gop",        required_argument, nullptr, 'g'},
@@ -230,6 +234,9 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         {"dump-ref",        required_argument, nullptr, 'D'},
         {"sdk-path",        required_argument, nullptr, 's'},
         {"gpu-test",        no_argument,       nullptr, 'G'},
+        {"decode-worker",   required_argument, nullptr, 'W'},
+        {"worker-count",    required_argument, nullptr, 'Y'},
+        {"worker-frames",   required_argument, nullptr, 'Z'},
         {"version",         no_argument,       nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -350,6 +357,24 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
             opt.pools = static_cast<int>(v);
             break;
         }
+        case 'J': {
+            long v;
+            if (!parseLong(optarg, v) || v < 1 || v > 256) {
+                fprintf(stderr, "无效的 --cpu-workers 值: %s\n", optarg);
+                return 1;
+            }
+            opt.cpuWorkers = static_cast<int>(v);
+            break;
+        }
+        case 'j': {
+            long v;
+            if (!parseLong(optarg, v) || v < 1 || v > 4096) {
+                fprintf(stderr, "无效的 --jobs 值: %s\n", optarg);
+                return 1;
+            }
+            opt.jobs = static_cast<int>(v);
+            break;
+        }
         case 'b': {
             long v;
             if (!parseLong(optarg, v) || v < 1 || v > 4096) {
@@ -395,6 +420,34 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         case 'G':
             opt.gpuTest = true;
             break;
+        case 'W': {
+            long v;
+            if (!parseLong(optarg, v) || v < 0 || v > 100000) {
+                fprintf(stderr, "无效的 --decode-worker 值: %s\n", optarg);
+                return 1;
+            }
+            opt.decodeWorker = true;
+            opt.workerId = v;
+            break;
+        }
+        case 'Y': {
+            long v;
+            if (!parseLong(optarg, v) || v < 1 || v > 256) {
+                fprintf(stderr, "无效的 --worker-count 值: %s\n", optarg);
+                return 1;
+            }
+            opt.workerCount = v;
+            break;
+        }
+        case 'Z': {
+            long v;
+            if (!parseLong(optarg, v) || v < 0 || v > 1000000000L) {
+                fprintf(stderr, "无效的 --worker-frames 值: %s\n", optarg);
+                return 1;
+            }
+            opt.workerFrames = v;
+            break;
+        }
         case 'h':
             wantHelp = true;
             break;
@@ -657,11 +710,11 @@ int runGpuTest(const CliOptions& opt, const MediaInfo& info)
 int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
 {
     std::string err;
-    SequentialDecoder dec;
+    CpuAsyncDecoder dec;
     EncodeSession enc;
     AudioQueue audio(64);
 
-    if (!dec.open(opt, info, err)) {
+    if (!dec.open(opt, info, frameCount, err)) {
         fprintf(stderr, "\n解码器打开失败: %s\n", err.c_str());
         return 2;
     }
@@ -698,12 +751,14 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         return true;
     };
 
+    // 多进程 CPU 解码：worker 子进程自主解码并通过管道流式回传，
+    // waitFrame 按帧号排序取帧，解码与 x265 编码流水线重叠。
     bool ok = true;
     auto tStart = std::chrono::steady_clock::now();
     auto tLast = tStart;
-    for (size_t frameNo = 0; frameNo < frameCount; ++frameNo) {
+    for (size_t done = 0; done < frameCount; ++done) {
         unsigned long long target =
-            static_cast<unsigned long long>(frameNo + 1) *
+            static_cast<unsigned long long>(done + 1) *
             static_cast<unsigned long long>(info.audio.sampleRate) *
             static_cast<unsigned long long>(info.fpsDen) /
             static_cast<unsigned long long>(info.fpsNum);
@@ -719,7 +774,7 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         }
 
         nraw::VideoFrame f;
-        if (!dec.decodeFrame(frameNo, f, err)) {
+        if (!dec.waitFrame(done, f, err)) {
             fprintf(stderr, "\n解码失败: %s\n", err.c_str());
             ok = false;
             break;
@@ -733,9 +788,9 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         auto now = std::chrono::steady_clock::now();
         if (now - tLast >= std::chrono::seconds(2)) {
             double dt = std::chrono::duration<double>(now - tStart).count();
-            double fps = dt > 0.0 ? static_cast<double>(frameNo + 1) / dt : 0.0;
+            double fps = dt > 0.0 ? static_cast<double>(done + 1) / dt : 0.0;
             fprintf(stderr, "\r%s",
-                    nraw::progressLine(frameNo + 1, frameCount, info.fpsNum,
+                    nraw::progressLine(done + 1, frameCount, info.fpsNum,
                                        info.fpsDen, fps)
                         .c_str());
             tLast = now;
@@ -901,6 +956,11 @@ int main(int argc, char** argv)
         opt.decodeMode = 2;
     if (opt.sdkPath.empty())
         opt.sdkPath = nraw::exeDir(argv[0]);
+
+    // 多进程 CPU 解码的 worker 子进程入口：独立完成解码并把帧写入 fd 3，
+    // 不参与父进程的其余流程（sidecar/门控/编码等）
+    if (opt.decodeWorker)
+        return nraw::runDecodeWorker(opt);
 
     static std::string partPath = opt.output + ".part";
     static std::string sidecarPartPath = opt.output + ".sidecar.json.part";
@@ -1070,10 +1130,29 @@ int main(int argc, char** argv)
     }
 
     int rc = 0;
-    if (useGpu)
+    if (useGpu) {
         rc = nraw::runGpuPath(opt, info, frameCount, gpuPipe);
-    else
+    } else {
+        // 统一 CPU 调度：总预算 = --jobs（默认 = 可用核心数），拆分为
+        //   解码 worker 进程数（每个 ~2 核：1 核解码 + SDK 内部线程开销）与
+        //   x265 编码线程池（剩余预算）。显式指定的 --cpu-workers / --pools 优先。
+        if (opt.jobs <= 0) {
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            opt.jobs = n > 0 ? static_cast<int>(n) : 8;
+        }
+        if (opt.cpuWorkers <= 0) {
+            long w = opt.jobs / 4;   // 每 worker 按 ~4 核预算 1 个（保守）
+            opt.cpuWorkers = w < 1 ? 1 : (w > 8 ? 8 : static_cast<int>(w));
+        }
+        if (opt.pools <= 0) {
+            long p = static_cast<long>(opt.jobs) - 2L * opt.cpuWorkers;
+            opt.pools = p < 1 ? 1 : (p > 1024 ? 1024 : static_cast<int>(p));
+        }
+        printf("CPU 调度: %d 个解码 worker 进程 + x265 pools=%d（总预算 %d 核；"
+               "--cpu-workers/--pools 可显式覆盖）\n",
+               opt.cpuWorkers, opt.pools, opt.jobs);
         rc = nraw::runCpuPath(opt, info, frameCount);
+    }
     gpuPipe.close();
     if (needHash)
         hashTh.join();

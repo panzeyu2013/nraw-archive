@@ -73,14 +73,23 @@ inline std::string progressLine(size_t done, size_t total,
     const double totalSec = static_cast<double>(total) * den / num;
     const double remainSec = totalSec - doneSec;
     double eta = wallNow();
-    if (fps > 0.01)
-        eta += remainSec / fps;
-    char buf[160];
+    double remainProcSec = 0.0;
+    if (fps > 0.01) {
+        // ETA = 当前墙钟 + 剩余帧数 / 处理速度（帧/秒）
+        // 注意不能写成 remainSec / fps：remainSec 是剩余"媒体时长"秒，
+        // 除以帧/秒单位错误，会低估约一个帧率的倍数
+        const double remainFrames =
+            static_cast<double>(total) - static_cast<double>(done);
+        remainProcSec = remainFrames / fps;
+        eta += remainProcSec;
+    }
+    char buf[200];
     snprintf(buf, sizeof(buf),
-             "[%s] %5.1f%%  %s / %s  剩余 %s  预计结束 %s  %.1f fps",
+             "[%s] %5.1f%%  %s / %s  剩余媒体 %s  处理剩余 %s  预计结束 %s  %.1f fps",
              bar.c_str(), f * 100.0,
              fmtDuration(doneSec).c_str(), fmtDuration(totalSec).c_str(),
-             fmtDuration(remainSec).c_str(), wallClock(eta).c_str(), fps);
+             fmtDuration(remainSec).c_str(), fmtDuration(remainProcSec).c_str(),
+             wallClock(eta).c_str(), fps);
     std::string s = buf;
     if (s.size() < 80)
         s.append(80 - s.size(), ' '); // 覆盖上一行更长内容的残留
@@ -105,12 +114,20 @@ struct CliOptions {
     int   chromaNr = -1;             // -1 = as-shot, 0=off, 1=on
     int   decodeMode = 0;            // 0=auto 1=gpu 2=cpu
 
+    // 多进程 CPU 解码内部参数（--decode-worker 等，隐藏，仅由父进程 exec 子进程时使用）
+    bool  decodeWorker = false;      // 当前进程是解码 worker
+    long  workerId = 0;              // worker 序号（解码 帧号 ≡ id (mod count)）
+    long  workerCount = 1;           // worker 总数
+    long  workerFrames = 0;          // 需解码的帧总数（父进程 clamp 后的值）
+
     int   crf = 14;
     std::string preset = "slow";
     int   keyint = 0;                // 0 = auto (round(fps*2))
     int   minKeyint = 1;
     int   openGop = 1;               // 1 = open GOP (scenecut), 0 = closed GOP
-    int   pools = 0;                 // 0 = 8 (default)
+    int   pools = 0;                 // x265 编码线程池 (0 = auto，由 --jobs 统一分配)
+    int   cpuWorkers = 0;            // CPU 解码 worker 进程数 (0 = auto，由 --jobs 分配)
+    int   jobs = 0;                  // CPU 总线程预算 (0 = auto = 核心数)；拆分 worker 数与 x265 pools
     int   buffers = 16;
     bool  gpuTest = false;           // --gpu-test: GPU 初始化+内核编译+A/B 门控测试后退出
 };
@@ -315,6 +332,38 @@ private:
     AlignedBuffer audioBlockBuf_;        // reusable decode block buffer
     std::vector<uint8_t> audioRepack_;   // reusable s24le repack buffer
 };
+
+// 多线程 CPU 解码器（多进程实现）：SDK 经典同步解码（Clip::DecodeVideoFrame）实测
+// ~1fps 且为进程内全局串行（并行 Clip/线程无效，4 进程并发实测 ~3.6fps 近线性扩展），
+// 因此 --decode cpu 通过 fork 出 N 个 worker 子进程（各自 ~1fps，帧号 ≡ k (mod N)），
+// 经管道流式回传 RGB 帧，父进程按帧号排序后交给 x265 编码；解码与编码流水线重叠。
+// 仅用于显式 --decode cpu（纯 CPU，不依赖 GPU/OpenCL）。音频在父进程内解码。
+// 用法: waitFrame() 按帧号递增取回解码帧（子进程自主解码，父进程背压由管道提供）。
+class CpuAsyncDecoder {
+public:
+    CpuAsyncDecoder() = default;
+    ~CpuAsyncDecoder() { close(); }
+    CpuAsyncDecoder(const CpuAsyncDecoder&) = delete;
+    CpuAsyncDecoder& operator=(const CpuAsyncDecoder&) = delete;
+
+    // frames = 需解码的帧总数（父进程按 --frames 裁剪后的值；worker 数与帧号分配基于它）
+    bool open(const CliOptions& opt, const MediaInfo& info, size_t frames,
+              std::string& err);
+    // 等待 frameNo 解码完成（按帧号递增调用），拷贝到 out；失败置 err。
+    bool waitFrame(size_t frameNo, VideoFrame& out, std::string& err);
+    bool decodeAudioWindow(unsigned long long targetSamples,
+                           AudioQueue& audio, std::string& err);
+    bool drainAudio(AudioQueue& audio, unsigned long long targetSamplesLimit,
+                    std::string& err);
+    void close();
+
+private:
+    void* impl_ = nullptr;
+};
+
+// 解码 worker 子进程入口（--decode-worker）：经典同步解码 帧号 ≡ id (mod count)，
+// 帧数据 [u64 frameNo][u32 size][payload] 写入 fd 3；返回 0=成功。
+int runDecodeWorker(const CliOptions& opt);
 
 // gpu_process.cpp
 class GpuPipeline {

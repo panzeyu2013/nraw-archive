@@ -2,6 +2,9 @@
 build/
 *.o
 
+# 个人脚本（含绝对路径，不入库）
+scripts/run.sh
+
 # 第三方闭源 SDK（不随仓库分发，按 README 放置到该目录）
 /R3DSDKv9_2_1/
 

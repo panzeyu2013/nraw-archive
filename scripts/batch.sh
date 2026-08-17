@@ -32,7 +32,7 @@ extra=()
 skip_next=0
 skip_drop=0
 last_opt=""
-value_opts="--kelvin --tint --iso --exposure --lens-correction --chroma-nr --decode --crf --preset --keyint --min-keyint --open-gop --pools --buffers --frames --sdk-path --output -o"
+value_opts="--kelvin --tint --iso --exposure --lens-correction --chroma-nr --decode --crf --preset --keyint --min-keyint --open-gop --pools --cpu-workers --jobs --buffers --frames --sdk-path --output -o"
 reject_opts="--dump-ref"
 for a in "$@"; do
     if [ "$skip_drop" -eq 1 ]; then

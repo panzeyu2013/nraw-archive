@@ -2,7 +2,7 @@
 
 **Nikon N-RAW (.NEV) → single-file HEVC archive tool** for Nikon Z8/Z9 footage.
 
-Two decode paths: a **GPU path** (AsyncDecoder multi-threaded decompression + REDOpenCL GPU debayer/IPP2, with automatic fallback when no GPU or OpenCL driver is present) and a **CPU path** (synchronous SDK decode). Zero intermediate files — SDK decode feeds x265 encoding directly into a single MOV, with a sidecar JSON recording checksums, metadata, and the decode path (`decode_path: gpu/cpu`).
+Two decode paths: a **GPU path** (AsyncDecoder multi-threaded decompression + REDOpenCL GPU debayer/IPP2, with automatic fallback when no GPU or OpenCL driver is present) and a **CPU path** (synchronous SDK decode parallelized across N worker processes: the classic SDK decode is globally serialized within a process (~1 fps), so `--decode cpu` forks N workers decoding frames k mod N over pipes, measured ~5× faster). Zero intermediate files — SDK decode feeds x265 encoding directly into a single MOV, with a sidecar JSON recording checksums, metadata, and the decode path (`decode_path: gpu/cpu`).
 
 > 中文版 → [README.zh-CN.md](README.zh-CN.md)
 
@@ -101,12 +101,14 @@ Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sideca
 | `--exposure <stops>` | exposure offset (EV) | camera metadata (as-shot) |
 | `--lens-correction auto\|on\|off` | lens (distortion) correction | on (auto lets the SDK decide) |
 | `--chroma-nr on\|off` | chroma noise reduction | camera default (off) |
-| `--decode gpu\|cpu\|auto` | decode path: auto = GPU probe + A/B gate (default); gpu = force GPU; cpu = pure CPU | auto |
+| `--decode gpu\|cpu\|auto` | decode path: auto = GPU probe + A/B gate (default); gpu = force GPU; cpu = pure CPU (multi-process parallel, measured ~5×) | auto |
 | `--crf <n>` | x265 constant quality | 14 (recommended 12–18) |
 | `--preset <p>` | x265 speed preset | slow |
 | `--keyint <n>` | GOP length | auto (2 s × frame rate) |
 | `--min-keyint <n>` | minimum GOP | 1 |
-| `--pools <n>` | x265 thread pool size | 8 (default, reduces thread churn) |
+| `--pools <n>` | x265 encoding thread pool (encode only; independent of decode workers) | auto (split by --jobs) |
+| `--cpu-workers <n>` | CPU decode worker processes (each ~1 fps, N workers ≈ N fps) | auto (split by --jobs, capped at 8) |
+| `--jobs <n>` | total CPU thread budget, auto-split into decode workers and x265 pools (explicit --cpu-workers/--pools win) | auto (= online cores) |
 | `--open-gop <0\|1>` | GOP structure: 1 = open (scenecut I-frames), 0 = closed (all IDR, frame-accurate cuts) | 1 |
 | `--buffers <n>` | frame queue depth (GPU path only) | 16 |
 | `--frames <n>` | process at most N frames (testing) | all |
