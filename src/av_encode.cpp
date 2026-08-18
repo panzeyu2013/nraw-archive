@@ -163,7 +163,11 @@ bool EncodeSessionImpl::openSession(const CliOptions& opt, const MediaInfo& info
         return false;
     }
 
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 0, 0)
+    vst_ = avformat_new_stream(oc_);
+#else
     vst_ = avformat_new_stream(oc_, nullptr);
+#endif
     if (!vst_) {
         err = "视频流创建失败";
         return false;
@@ -179,7 +183,11 @@ bool EncodeSessionImpl::openSession(const CliOptions& opt, const MediaInfo& info
     vst_->r_frame_rate = vst_->avg_frame_rate;
 
     if (!opt.noAudio && info.audio.present) {
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 0, 0)
+        ast_ = avformat_new_stream(oc_);
+#else
         ast_ = avformat_new_stream(oc_, nullptr);
+#endif
         if (!ast_) {
             err = "音频流创建失败";
             return false;
@@ -188,12 +196,12 @@ bool EncodeSessionImpl::openSession(const CliOptions& opt, const MediaInfo& info
         ast_->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         ast_->codecpar->codec_id = AV_CODEC_ID_PCM_S24LE;
         ast_->codecpar->sample_rate = info.audio.sampleRate;
-        ast_->codecpar->channels = info.audio.channels;
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
         AVChannelLayout lay;
         av_channel_layout_default(&lay, info.audio.channels);
         av_channel_layout_copy(&ast_->codecpar->ch_layout, &lay);
 #else
+        ast_->codecpar->channels = info.audio.channels;
         ast_->codecpar->channel_layout = av_get_default_channel_layout(info.audio.channels);
 #endif
         ast_->codecpar->bits_per_coded_sample = 24;
