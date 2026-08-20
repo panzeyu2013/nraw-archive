@@ -56,7 +56,7 @@ jobs:
           gh release upload "$TAG" dist/nraw-archive-linux-x64.tar.gz --clobber
 
   macos-arm64:
-    runs-on: macos-14  # Apple Silicon (arm64) runner
+    runs-on: macos-latest  # Apple Silicon (arm64) runner
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
