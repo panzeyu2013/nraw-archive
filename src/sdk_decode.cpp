@@ -14,6 +14,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+extern char** environ;  // macOS 的 unistd.h 不声明 environ，需显式声明
+#endif
+
 #include "R3DSDK.h"
 
 namespace nraw {
@@ -667,7 +671,7 @@ ssize_t writeFull(int fd, const void* buf, size_t n)
     return 0;
 }
 
-// worker 子进程命令行（父进程构造，posix_spawn /proc/self/exe）
+// worker 子进程命令行（父进程构造，posix_spawn 路径用 selfExePath() 解析）
 std::vector<std::string> workerArgs(const CliOptions& opt, size_t id,
                                     size_t count, size_t total)
 {
@@ -744,11 +748,14 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
 
     for (size_t k = 0; k < nWorkers_; ++k) {
         int fds[2];
-        // O_CLOEXEC：防止 worker 继承其他 worker 的管道读端（fd 泄漏/误用）
-        if (pipe2(fds, O_CLOEXEC) != 0) {
+        // O_CLOEXEC：防止 worker 继承其他 worker 的管道读端（fd 泄漏/误用）。
+        // macOS 无 pipe2，用 pipe + fcntl 等效实现。
+        if (pipe(fds) != 0) {
             err = "pipe 创建失败: " + std::string(strerror(errno));
             return false;
         }
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
         std::vector<std::string> args = workerArgs(opt, k, nWorkers_, frames);
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);
@@ -761,8 +768,9 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
         posix_spawn_file_actions_adddup2(&fa, fds[1], 3);
         posix_spawn_file_actions_addclose(&fa, fds[1]);
         posix_spawn_file_actions_addclose(&fa, fds[0]);
+        const std::string selfExe = nraw::selfExePath();
         pid_t pid = -1;
-        int sr = posix_spawn(&pid, "/proc/self/exe", &fa, nullptr,
+        int sr = posix_spawn(&pid, selfExe.c_str(), &fa, nullptr,
                              argv.data(), environ);
         posix_spawn_file_actions_destroy(&fa);
         ::close(fds[1]);

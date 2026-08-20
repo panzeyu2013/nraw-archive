@@ -89,18 +89,15 @@ std::string defaultOutput(const std::string& input)
 
 std::string exeDir(const char* argv0)
 {
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        std::string p(buf);
+    std::string p = nraw::selfExePath();
+    if (!p.empty()) {
         size_t slash = p.rfind('/');
         if (slash != std::string::npos)
             return slash == 0 ? "/" : p.substr(0, slash);
     }
     if (!argv0 || !*argv0)
         return ".";
-    std::string p(argv0);
+    p = argv0;
     size_t slash = p.rfind('/');
     if (slash == std::string::npos)
         return ".";

@@ -18,6 +18,13 @@
 #include <utility>
 #include <algorithm>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <limits.h>
+#else
+#include <unistd.h>
+#endif
+
 // FFmpeg 类型前向声明（全局命名空间；archive.h 不依赖 FFmpeg 头）
 struct AVCodecParameters;
 struct AVRational;
@@ -27,6 +34,34 @@ struct AVStream;
 namespace nraw {
 
 constexpr const char* kToolVersion = "1.1.0";
+
+// 当前可执行文件的完整路径（跨平台）。
+// macOS: _NSGetExecutablePath；Linux: readlink /proc/self/exe。
+// 失败时返回空串，由调用方回退到 argv[0]。
+inline std::string selfExePath()
+{
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    if (size == 0)
+        return std::string();
+    std::vector<char> buf(size + 1, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0)
+        return std::string();
+    char resolved[PATH_MAX];
+    if (realpath(buf.data(), resolved))
+        return std::string(resolved);
+    return std::string(buf.data());
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return std::string(buf);
+    }
+    return std::string();
+#endif
+}
 
 // 后续结构前向声明（函数签名引用）
 struct CliOptions;

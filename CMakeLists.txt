@@ -49,9 +49,16 @@ target_include_directories(nraw_archive PRIVATE
     ${R3D_SDK_ROOT}/Include
 )
 if(APPLE)
-    # OpenCL.framework 头文件目录（#include <CL/opencl.h> 需要）
-    get_filename_component(OPENCL_FW_HEADERS "${OPENCL_LIB}/../Headers" ABSOLUTE)
-    target_include_directories(nraw_archive PRIVATE "${OPENCL_FW_HEADERS}")
+    # OpenCL.framework 头文件位于框架顶层（无 CL/ 子目录），而本代码与
+    # R3DSDK 头文件都使用 #include <CL/opencl.h>。在 build 目录生成兼容布局
+    # （CL/ 与 OpenCL/ 两份拷贝——opencl.h 内部用 <OpenCL/...> 引用自身）。
+    get_filename_component(OPENCL_FW_HEADERS "${OPENCL_LIB}/Headers" ABSOLUTE)
+    set(OPENCL_COMPAT_DIR "${CMAKE_BINARY_DIR}/opencl-headers")
+    file(MAKE_DIRECTORY "${OPENCL_COMPAT_DIR}/CL" "${OPENCL_COMPAT_DIR}/OpenCL")
+    file(GLOB OPENCL_FW_HEADER_FILES "${OPENCL_FW_HEADERS}/*.h")
+    file(COPY ${OPENCL_FW_HEADER_FILES} DESTINATION "${OPENCL_COMPAT_DIR}/CL")
+    file(COPY ${OPENCL_FW_HEADER_FILES} DESTINATION "${OPENCL_COMPAT_DIR}/OpenCL")
+    target_include_directories(nraw_archive PRIVATE "${OPENCL_COMPAT_DIR}")
 endif()
 
 if(APPLE)

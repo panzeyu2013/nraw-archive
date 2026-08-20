@@ -1063,11 +1063,8 @@ bool EncodeSessionImpl::openSession(const CliOptions& opt, const MediaInfo& info
         return false;
     }
 
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 0, 0)
-    vst_ = avformat_new_stream(oc_);
-#else
+    // 2 参数形式在所有 FFmpeg 版本可用（FFmpeg 7 的 1 参数便捷重载在 8.x 已移除）
     vst_ = avformat_new_stream(oc_, nullptr);
-#endif
     if (!vst_) {
         err = "视频流创建失败";
         return false;
@@ -1083,11 +1080,7 @@ bool EncodeSessionImpl::openSession(const CliOptions& opt, const MediaInfo& info
     vst_->r_frame_rate = vst_->avg_frame_rate;
 
     if (!opt.noAudio && info.audio.present) {
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 0, 0)
-        ast_ = avformat_new_stream(oc_);
-#else
         ast_ = avformat_new_stream(oc_, nullptr);
-#endif
         if (!ast_) {
             err = "音频流创建失败";
             return false;
