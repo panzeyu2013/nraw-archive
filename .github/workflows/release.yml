@@ -1,0 +1,91 @@
+name: release-build
+
+# 发布构建：workflow_dispatch 指定 tag，或 release 发布时自动触发。
+# 产物上传到对应 tag 的 GitHub Release。
+#
+# R3DSDK（闭源，约 89MB，不入库）的获取方式：
+#   1) 配置仓库 Secret `R3D_SDK_URL`：一个指向 R3DSDKv9_2_1 目录
+#      tar.gz 的私有下载 URL（推荐）；
+#   2) 或把 R3DSDKv9_2_1/ 放入检出目录（仅当你的镜像仓库包含它）。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要附加产物的 Git tag（例如 v1.1.0）'
+        required: true
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libavformat-dev libavcodec-dev \
+            libavutil-dev libswscale-dev libx265-dev opencl-headers ocl-icd-opencl-dev
+      - name: Fetch R3DSDK
+        run: |
+          if [ -n "${{ secrets.R3D_SDK_URL }}" ]; then
+            curl -fsSL "${{ secrets.R3D_SDK_URL }}" -o /tmp/r3d.tar.gz
+            tar xzf /tmp/r3d.tar.gz -C .
+          fi
+          test -f R3DSDKv9_2_1/Include/R3DSDK.h || { echo "R3DSDK 缺失"; exit 1; }
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          mkdir -p dist/nraw-archive-linux-x64
+          cp build/nraw_archive build/RED*.so dist/nraw-archive-linux-x64/
+          cp README.md LICENSE README.zh-CN.md dist/nraw-archive-linux-x64/
+          cd dist && tar czf nraw-archive-linux-x64.tar.gz nraw-archive-linux-x64
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          gh release upload "$TAG" dist/nraw-archive-linux-x64.tar.gz --clobber
+
+  macos-arm64:
+    runs-on: macos-14  # Apple Silicon (arm64) runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          brew install ffmpeg x265 || true
+          brew link ffmpeg || true
+      - name: Fetch R3DSDK
+        run: |
+          if [ -n "${{ secrets.R3D_SDK_URL }}" ]; then
+            curl -fsSL "${{ secrets.R3D_SDK_URL }}" -o /tmp/r3d.tar.gz
+            tar xzf /tmp/r3d.tar.gz -C .
+          fi
+          test -f R3DSDKv9_2_1/Include/R3DSDK.h || { echo "R3DSDK 缺失"; exit 1; }
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(sysctl -n hw.ncpu)
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          mkdir -p dist/nraw-archive-macos-arm64
+          cp build/nraw_archive dist/nraw-archive-macos-arm64/
+          cp build/RED*.dylib dist/nraw-archive-macos-arm64/ 2>/dev/null || true
+          cp README.md LICENSE README.zh-CN.md dist/nraw-archive-macos-arm64/
+          cd dist && tar czf nraw-archive-macos-arm64.tar.gz nraw-archive-macos-arm64
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          gh release upload "$TAG" dist/nraw-archive-macos-arm64.tar.gz --clobber

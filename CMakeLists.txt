@@ -12,9 +12,17 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 find_package(Threads REQUIRED)
 
-find_path(OPENCL_HEADER_DIR CL/opencl.h)
-if(NOT OPENCL_HEADER_DIR)
-    message(FATAL_ERROR "缺少 OpenCL 头文件（GPU 路径编译需要）: sudo apt install opencl-headers")
+if(APPLE)
+    # macOS 自带 OpenCL.framework（头文件在框架内，无需额外依赖）
+    find_library(OPENCL_LIB OpenCL)
+    if(NOT OPENCL_LIB)
+        message(FATAL_ERROR "缺少 OpenCL.framework")
+    endif()
+else()
+    find_path(OPENCL_HEADER_DIR CL/opencl.h)
+    if(NOT OPENCL_HEADER_DIR)
+        message(FATAL_ERROR "缺少 OpenCL 头文件（GPU 路径编译需要）: sudo apt install opencl-headers")
+    endif()
 endif()
 
 set(R3D_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/R3DSDKv9_2_1" CACHE PATH
@@ -40,26 +48,48 @@ target_include_directories(nraw_archive PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${R3D_SDK_ROOT}/Include
 )
+if(APPLE)
+    # OpenCL.framework 头文件目录（#include <CL/opencl.h> 需要）
+    get_filename_component(OPENCL_FW_HEADERS "${OPENCL_LIB}/../Headers" ABSOLUTE)
+    target_include_directories(nraw_archive PRIVATE "${OPENCL_FW_HEADERS}")
+endif()
 
-target_link_libraries(nraw_archive PRIVATE
-    PkgConfig::FFMPEG
-    ${R3D_SDK_ROOT}/Lib/linux64/libR3DSDK-cpp11.a
-    dl
-    pthread
-    m
-)
+if(APPLE)
+    # macOS：R3DSDK mac64 通用二进制（x86_64 + arm64）
+    target_link_libraries(nraw_archive PRIVATE
+        PkgConfig::FFMPEG
+        ${R3D_SDK_ROOT}/Lib/mac64/libR3DSDK-libcpp.a
+        Threads::Threads
+        m
+    )
+    add_custom_command(TARGET nraw_archive POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${R3D_SDK_ROOT}/Redistributable/mac/REDR3D.dylib
+                ${R3D_SDK_ROOT}/Redistributable/mac/REDDecoder.dylib
+                ${R3D_SDK_ROOT}/Redistributable/mac/REDOpenCL.dylib
+                ${R3D_SDK_ROOT}/Redistributable/mac/REDMetal.dylib
+                $<TARGET_FILE_DIR:nraw_archive>
+        COMMENT "拷贝 R3D SDK 动态库到可执行文件目录")
+else()
+    target_link_libraries(nraw_archive PRIVATE
+        PkgConfig::FFMPEG
+        ${R3D_SDK_ROOT}/Lib/linux64/libR3DSDK-cpp11.a
+        dl
+        pthread
+        m
+    )
+    target_link_options(nraw_archive PRIVATE -no-pie)
+    add_custom_command(TARGET nraw_archive POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${R3D_SDK_ROOT}/Redistributable/linux/REDR3D-x64.so
+                ${R3D_SDK_ROOT}/Redistributable/linux/REDDecoder-x64.so
+                ${R3D_SDK_ROOT}/Redistributable/linux/REDOpenCL-x64.so
+                ${R3D_SDK_ROOT}/Redistributable/linux/REDCuda-x64.so
+                $<TARGET_FILE_DIR:nraw_archive>
+        COMMENT "拷贝 R3D SDK 动态库到可执行文件目录")
+endif()
 
 target_compile_options(nraw_archive PRIVATE -O2 -Wall -Wextra)
-target_link_options(nraw_archive PRIVATE -no-pie)
-
-add_custom_command(TARGET nraw_archive POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${R3D_SDK_ROOT}/Redistributable/linux/REDR3D-x64.so
-            ${R3D_SDK_ROOT}/Redistributable/linux/REDDecoder-x64.so
-            ${R3D_SDK_ROOT}/Redistributable/linux/REDOpenCL-x64.so
-            ${R3D_SDK_ROOT}/Redistributable/linux/REDCuda-x64.so
-            $<TARGET_FILE_DIR:nraw_archive>
-    COMMENT "拷贝 R3D SDK 动态库到可执行文件目录")
 
 include(CTest)
 if(BUILD_TESTING)
