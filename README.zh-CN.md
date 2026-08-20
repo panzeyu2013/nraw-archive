@@ -20,7 +20,7 @@ FFmpeg ≥ 6.0 已内置 N-RAW（`nraw`）demuxer/decoder，但那是 codec 层�
 | VUI 标记 | 只写 matrix + range；primaries / transfer 留空 |
 | 音频 | LPCM s24le（SDK 24bit 大端位精确重排） |
 | 中间文件 | 无 |
-| 完整性 | 原子写入（`.part` + rename）；sidecar 记录源文件 sha256；GPU 路径 A/B 门控 |
+| 完整性 | 原子写入（`.part` + rename）；**失败保留 `.part` 不删除**（错误信息含路径/errno/磁盘剩余空间，moov 已落盘时自动验证并提示可改名）；sidecar 记录源文件 sha256；GPU 路径 A/B 门控 |
 
 ## 构建与运行前置
 
@@ -120,9 +120,15 @@ nraw-archive [options] input.NEV [output.mov]
 ## 输出与 sidecar
 
 - `xxx.h265.mov`：HEVC Main10 4:2:0 10bit，crf 14，matrix=BT.2020、full range，音频 pcm_s24le。**写入是原子的**：先写 `xxx.h265.mov.part`，成功后 rename 替换，失败/中断不破坏已有归档。
+- **失败保护、自动重建与断点续传**：
+  - 任何阶段失败（编码中途写错误、trailer/关闭失败）都会**保留 `.part` 部分产物**而不是删除——数小时的编码成果不会被程序自己抹掉。错误信息含保留路径、errno 详情（区分 NFS I/O 错误与磁盘满）和磁盘剩余空间；每 500 帧刷盘一次，NFS/磁盘错误在编码途中尽早暴露。
+  - 收尾失败时程序**自动重建完整文件**：用样本数据重新过一遍 MOV 封装器生成正确的 moov（输出到最终路径，验证可播放后报告路径），即使关闭/flush 失败也能立即拿到可播放的归档。
+  - 编码过程记录样本日志（`<out>.samples`，二进制：样本大小/时间戳/帧号）与检查点（`<out>.ckpt`，每 500 帧刷新）；**下次运行自动检测到 `.part`+检查点即自动续传**：源文件与编码参数（crf/preset/GOP/色彩/镜头矫正/解码路径等）经 SHA-256 校验一致后，已编码部分直接复用（不重新解码/编码），从续传点继续编码剩余帧——12 小时的编码中断后重跑只需几分钟收尾。续传点取**最后完整关键帧**：closed-GOP 直接关键帧对齐；open-GOP 因 scenecut 关键帧可能先于其 GOP 尾部 B 帧写入，续传点再**回退 17 帧**（=2×(bframes+P 间隔)-1）保证尾部 B 帧引用封闭，不产生解码缺口；随后按"无时间轴平移"约束**动态微调**（movenc 6.1 要求 dts 严格递增且 pts≥dts：重放区最大 dts 必须小于重编码首包 dts，否则整体平移 pts 会造成接缝跳变、甚至重放尾部引用重编码区导致解码失败——实测 open-GOP 默认配置下关键帧锚定续传点即触发该问题）。不满足时续传点逐帧前移（可落在非关键帧，新 IDR 从该帧起）直到约束满足，保证接缝处 dts/pts 严格连续；音频已编码部分同样复用，衔接点与块边界对齐。
+  - 续传可反复进行：**续传会话自身再次中断后仍可再次续传**（编码器在中断时冲刷挂起帧，`.part`/`.samples`/`.ckpt` 始终自洽）。closed-GOP 续传点对齐关键帧（重放 GOP 尾部引用完整）；open-GOP 因 scenecut 关键帧可能先于尾部 B 帧写入，续传点回退 17 帧避免丢帧。
+  - 信号中断（SIGINT/SIGTERM）同样保留部分产物供续传。
 - `xxx.h265.mov.sidecar.json`：sha256（源文件，内置 SHA-256 实现计算，不依赖外部 sha256sum）、色彩空间 RWG/Log3G10、matrix BT.2020 full range、镜头矫正状态、解码路径（`decode_path: gpu|cpu`，含 `gpu_device` 与 A/B 门控最低 PSNR `gate_psnr_db`）、编码参数（crf/preset/keyint 等）、clip 元数据。
 
-退出码：0 成功；1 参数错误；2 SDK/媒体打开失败（含 `--decode gpu` 强制模式下的 GPU 不可用）；4 处理失败（编码/写入/GPU 管线中断）；5 sidecar 写入失败。`--gpu-test` 模式下：0 = GPU 可用（初始化+门控通过），2 = GPU 初始化失败，4 = A/B 门控未达标或未能执行；`--gpu-test` 无输入文件时（仅初始化+内核编译）：0 = 初始化通过，2 = 初始化失败。SIGINT/SIGTERM 时清理部分产物后以 130 退出。
+退出码：0 成功；1 参数错误；2 SDK/媒体打开失败（含 `--decode gpu` 强制模式下的 GPU 不可用）；4 处理失败（编码/写入/GPU 管线中断）；5 sidecar 写入失败。`--gpu-test` 模式下：0 = GPU 可用（初始化+门控通过），2 = GPU 初始化失败，4 = A/B 门控未达标或未能执行；`--gpu-test` 无输入文件时（仅初始化+内核编译）：0 = 初始化通过，2 = 初始化失败。SIGINT/SIGTERM 时保留部分产物（`.part`/`.samples`/`.ckpt`）供下次运行自动续传，以 130 退出。
 
 处理过程中每 2 秒刷新一行进度：进度条 + 百分比 + 已处理/总时长 + 剩余时长 + 预计结束时间（墙钟）+ 实际 fps。
 

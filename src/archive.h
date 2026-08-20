@@ -8,6 +8,7 @@
 #include <cmath>
 #include <ctime>
 #include <string>
+#include <future>
 #include <vector>
 #include <deque>
 #include <memory>
@@ -15,10 +16,21 @@
 #include <condition_variable>
 #include <atomic>
 #include <utility>
+#include <algorithm>
+
+// FFmpeg 类型前向声明（全局命名空间；archive.h 不依赖 FFmpeg 头）
+struct AVCodecParameters;
+struct AVRational;
+struct AVFormatContext;
+struct AVStream;
 
 namespace nraw {
 
 constexpr const char* kToolVersion = "1.0.0";
+
+// 后续结构前向声明（函数签名引用）
+struct CliOptions;
+struct MediaInfo;
 
 // ---------- 进度条 ----------
 
@@ -96,6 +108,128 @@ inline std::string progressLine(size_t done, size_t total,
     return s;
 }
 
+// 编码样本日志：记录写入输出文件的每个样本，用于收尾失败时自动重建 moov
+// （把 .part 恢复为可播放的完整文件），以及断点续传（重放已编码数据）
+struct SampleLog {
+    struct Entry {
+        bool video = false;    // true=视频, false=音频
+        int64_t offset = 0;    // 记录的实际文件偏移（准确）
+        int64_t size = 0;      // 样本字节数（movenc 不物理拆包，总大小准确）
+        int64_t pts = 0;
+        int64_t dts = 0;
+        bool key = false;      // 关键帧（视频）
+        int64_t frameNo = -1;  // 视频：帧号（显示序）；音频：-1。
+                               // 直接记录帧号而非从 pts 换算：movenc 写头时会
+                               // 改写视频流 time_base（整数帧率 ×512/×256），
+                               // pts 刻度随帧率变化，pts/fpsDen 不可靠
+    };
+    std::vector<Entry> entries;  // 提交顺序（与原始编码一致，含音视频交错）
+
+    size_t videoCount() const
+    {
+        size_t n = 0;
+        for (const auto& e : entries)
+            if (e.video)
+                ++n;
+        return n;
+    }
+    // 最后一条音频条目的结束采样号（字节数 / (channels*3)）
+    unsigned long long audioEndSample(size_t channels) const
+    {
+        if (channels == 0)
+            return 0;
+        unsigned long long end = 0;
+        for (const auto& e : entries) {
+            if (!e.video) {
+                unsigned long long samples =
+                    static_cast<unsigned long long>(e.size) / (channels * 3);
+                end = std::max(end, static_cast<unsigned long long>(e.pts) + samples);
+            }
+        }
+        return end;
+    }
+    // 持久化（续传检查点用）：<out>.samples 二进制
+    bool saveTo(const std::string& path, std::string& err) const;
+    bool loadFrom(const std::string& path, std::string& err);
+    // 续传：丢弃帧号 >= frame 的视频条目（其数据将被重新编码，不在新 .part 中；
+    // 保留会导致重放/自动重建的布局错位）。音频条目全部保留（重放）。
+    void purgeVideoFrom(int64_t frame)
+    {
+        std::vector<Entry> keep;
+        keep.reserve(entries.size());
+        for (const auto& e : entries) {
+            if (e.video && e.frameNo >= frame)
+                continue;
+            keep.push_back(e);
+        }
+        entries.swap(keep);
+    }
+};
+
+// 编码会话写入样本日志的目标（main/测试在运行前设置；编码结束后可安全读取）
+extern SampleLog* g_sampleLog;
+
+// 源文件 SHA-256（续传校验/检查点需要）：主程序后台线程异步计算，
+// 编码循环不阻塞等待；写检查点/收尾时按需 get()（首次即等待完成）。
+extern std::shared_future<std::string> g_sourceHashFut;
+
+// 收尾失败后的自动恢复：读取 .part 的样本数据，经 mov muxer 重建完整文件
+// （含正确的 moov/stsd/时间戳）。成功返回 true，outPath 为重建产物，
+// recoveredFrames 为实际恢复的视频帧数（文件截断时可能少于日志记录）。
+bool tryRecoverMov(const std::string& partPath, const std::string& outPath,
+                   AVCodecParameters* vpar, AVCodecParameters* apar,
+                   const AVRational& vtb, const AVRational& atb,
+                   const SampleLog& log, size_t& recoveredFrames, std::string& err);
+
+// 定位 .part 中 mdat 数据区起点（ftyp(+wide) + mdat 头之后；>4GB 扩展头）
+long findMdatStart(FILE* in, long partSize);
+
+// 重写 .part：丢弃续传点之后（含）的视频条目，使 .part 与已清理的日志布局一致。
+// 返回 true 时 partPath 已原位替换为清理后的版本。
+bool purgePartFile(const std::string& partPath, const SampleLog& log,
+                   int64_t skipVideoFromFrame, std::string& err,
+                   bool skipAudio = false);
+
+// 从 .part 顺序读取样本并提交到已写头的 muxer（复用已编码数据；续传/重建共用）。
+// skipVideoFromFrame >= 0 时丢弃该帧号之后（含）的视频条目（续传对齐最后关键帧，
+// 其 GOP 尾部引用不完整需重新编码）。skipAudio=true 时音频条目跳过（推进偏移但不
+// 提交）。
+// 返回实际提交的视频帧数（.part 尾部截断时少于日志记录）。
+bool submitPartSamples(const std::string& partPath, const SampleLog& log,
+                       AVFormatContext* oc, AVStream* vs, AVStream* as,
+                       size_t& videoCount, std::string& err,
+                       int64_t skipVideoFromFrame = -1, int64_t fpsDen = 1,
+                       bool skipAudio = false);
+
+// 统计 .part 中完整存在的样本数（顺序布局，尾部截断时提前停止）
+size_t countCompleteSamples(const std::string& partPath, const SampleLog& log);
+
+// 检查点：断点续传的元数据
+struct Checkpoint {
+    int version = 1;
+    std::string toolVersion;
+    std::string input;
+    std::string sourceSha256;
+    std::string settingsHash;
+    size_t videoFrames = 0;              // 已完整写入的视频帧数
+    unsigned long long audioEndSample = 0;
+    size_t totalFrames = 0;
+    std::string toJson() const;
+    bool loadJson(const std::string& text);
+    static bool loadFile(const std::string& path, Checkpoint& ck, std::string& err);
+};
+bool writeCheckpoint(const std::string& path, const CliOptions& opt,
+                     const MediaInfo& info, const SampleLog& log, std::string& err,
+                     bool waitHash = true);
+// 编码参数指纹（crf/preset/GOP/色彩/镜头矫正/解码路径等），续传校验用
+std::string settingsHash(const CliOptions& opt);
+bool fileExists(const std::string& path);
+bool readFileText(const std::string& path, std::string& out);
+
+// 断点续传自动检测：发现 <out>.part + 检查点则设置 opt 的续传字段。
+// 返回 0=无续传（全新编码），1=已设置续传，2=存在 .part 但不可续传（msg 说明原因）
+int detectResume(CliOptions& opt, const MediaInfo& info, std::string& msg);
+
 struct CliOptions {
     std::string input;
     std::string output;
@@ -119,6 +253,15 @@ struct CliOptions {
     long  workerId = 0;              // worker 序号（解码 帧号 ≡ id (mod count)）
     long  workerCount = 1;           // worker 总数
     long  workerFrames = 0;          // 需解码的帧总数（父进程 clamp 后的值）
+    long  workerStart = 0;           // worker 起始帧（续传时跳过已编码部分）
+
+    // 续传（内部，主程序从检查点自动检测并设置）
+    bool  resumeMode = false;        // 本次是续传
+    long  resumeFrame = 0;           // 已完整写入的视频帧数（0 = 全新编码）
+    unsigned long long resumeAudioSample = 0;  // 音频续传起点（采样号）
+    long  testStopAfter = -1;        // 测试钩子：编码 N 帧后模拟中断（保留部分产物）
+
+    std::string sourceSha256;        // 源文件哈希（写检查点/校验用）
 
     int   crf = 14;
     std::string preset = "slow";
@@ -321,6 +464,12 @@ public:
                            AudioQueue& audio, std::string& err);
     bool drainAudio(AudioQueue& audio, unsigned long long targetSamplesLimit,
                     std::string& err);
+    bool decodeOneAudioBlock(AudioQueue& audio, unsigned long long targetSamples,
+                             std::string& err);
+    // 续传：解码目标采样号之前的音频块并直接丢弃（不经过队列，避免阻塞）
+    bool discardAudioTo(unsigned long long sample, std::string& err);
+    // 续传：丢弃目标采样号之前的音频块
+    bool seekAudioTo(unsigned long long sample, std::string& err);
     bool audioOn() const { return audioOn_; }
     void close();
 
@@ -355,6 +504,10 @@ public:
                            AudioQueue& audio, std::string& err);
     bool drainAudio(AudioQueue& audio, unsigned long long targetSamplesLimit,
                     std::string& err);
+    bool decodeOneAudioBlock(AudioQueue& audio, unsigned long long targetSamples,
+                             std::string& err);
+    // 续传：丢弃目标采样号之前的音频块
+    bool seekAudioTo(unsigned long long sample, std::string& err);
     void close();
 
 private:
@@ -382,7 +535,8 @@ public:
     bool decodeSync(size_t frameNo, VideoFrame& out, std::string& err);
     // start AsyncDecoder + worker thread; frames is the ordered encoder queue;
     // abort is the shared encoder-abort flag the worker must raise on any failure
-    bool start(FrameQueue& frames, std::atomic<bool>* abort, std::string& err);
+    bool start(FrameQueue& frames, std::atomic<bool>* abort, size_t startFrame,
+               std::string& err);
     // submit frame for async decompress; blocks while the raw pool is full
     bool submit(size_t frameNo, std::string& err);
     // wait for all submitted frames, join worker, EOF the frame queue
@@ -413,6 +567,12 @@ public:
     bool writeAudio(const AudioPacket& p, std::string& err);
     bool finish(std::string& err);
     void cleanup();
+    void setHardAbort();
+    // 续传：把旧 .part 的已编码样本重放进本会话（复用数据，不重新编码）
+    bool replayOldSamples(const std::string& oldPart, std::string& err);
+    size_t replayedFrames() const;
+    void flushSamples();
+    bool flushEnc(std::string& err);  // 收尾冲刷编码器（中断时保留挂起帧）
 
 private:
     void* impl_ = nullptr;

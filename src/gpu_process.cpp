@@ -282,7 +282,8 @@ public:
     // 不打开剪辑、不分配缓冲（--gpu-test 无输入文件模式）
     bool initGpuOnly(std::string& err);
     bool decodeSync(size_t frameNo, VideoFrame& out, std::string& err);
-    bool start(FrameQueue& frames, std::atomic<bool>* abort, std::string& err);
+    bool start(FrameQueue& frames, std::atomic<bool>* abort, size_t startFrame,
+               std::string& err);
     bool submit(size_t frameNo, std::string& err);
     bool finish(std::string& err);
     void close();
@@ -375,6 +376,7 @@ private:
     mutable std::string failMsg_;
     mutable std::atomic<bool> fail_{false};
     std::atomic<bool>* abort_ = nullptr;
+    size_t startFrame_ = 0;
     FrameQueue* frames_ = nullptr;
     std::string deviceName_;
 };
@@ -612,7 +614,8 @@ bool GpuPipelineImpl::decodeSync(size_t frameNo, VideoFrame& out, std::string& e
     return ok;
 }
 
-bool GpuPipelineImpl::start(FrameQueue& frames, std::atomic<bool>* abort, std::string& err)
+bool GpuPipelineImpl::start(FrameQueue& frames, std::atomic<bool>* abort,
+                              size_t startFrame, std::string& err)
 {
     if (!adec_) {
         err = "管线未初始化";
@@ -622,6 +625,7 @@ bool GpuPipelineImpl::start(FrameQueue& frames, std::atomic<bool>* abort, std::s
         return true;
     frames_ = &frames;
     abort_ = abort;
+    startFrame_ = startFrame;
     {
         std::lock_guard<std::mutex> lk(readyM_);
         fail_.store(false, std::memory_order_relaxed);
@@ -859,7 +863,10 @@ bool GpuPipelineImpl::debayerComplete(Slot* s, VideoFrame& out, std::string& err
 
 void GpuPipelineImpl::worker()
 {
-    size_t nextPush = 0;
+    // 起点自适应：续传时 submit 从 resumeFrame（>0）开始，ready_ 里不会出现
+    // 帧 0——若硬编码 nextPush=0 会永远不命中 → 三方死锁（worker 等 ready、
+    // 主线程等 slot、编码线程等帧）。首个到达的 ready 条目即起点。
+    size_t nextPush = startFrame_;
     for (;;) {
         // 阶段 A：把下一帧提交到 GPU（processAsync，不等待）。
         // 正常时 inflight 保持 ≤ kMaxInflight；收尾（workerStop_）时允许超限，
@@ -902,6 +909,10 @@ void GpuPipelineImpl::worker()
                 doneCv_.notify_all();
                 continue;
             }
+            // 提交成功即推进 nextPush：允许继续提交下一帧（多帧在途，
+            // kMaxInflight 重叠 debayer/complete 才生效；否则恒 ≤1 串行）。
+            // 保序由 inflight_ 队列保证（Phase B 总是完成最旧）。
+            ++nextPush;
             continue;  // 已入 inflight_，继续提交更多帧
         }
         // 阶段 B：完成最旧 inflight 帧（completeAsync + 回读 + push，保序）
@@ -918,7 +929,6 @@ void GpuPipelineImpl::worker()
                     setFail("内存不足 (OOM)");
                 }
             }
-            ++nextPush;
             release(slot);
             {
                 std::lock_guard<std::mutex> lk(readyM_);
@@ -1015,9 +1025,10 @@ bool GpuPipeline::decodeSync(size_t frameNo, VideoFrame& out, std::string& err)
     return static_cast<GpuPipelineImpl*>(impl_)->decodeSync(frameNo, out, err);
 }
 
-bool GpuPipeline::start(FrameQueue& frames, std::atomic<bool>* abort, std::string& err)
+bool GpuPipeline::start(FrameQueue& frames, std::atomic<bool>* abort,
+                          size_t startFrame, std::string& err)
 {
-    return static_cast<GpuPipelineImpl*>(impl_)->start(frames, abort, err);
+    return static_cast<GpuPipelineImpl*>(impl_)->start(frames, abort, startFrame, err);
 }
 
 bool GpuPipeline::submit(size_t frameNo, std::string& err)

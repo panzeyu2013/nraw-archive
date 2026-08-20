@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <utility>
 #include <vector>
 
@@ -290,9 +291,14 @@ bool SequentialDecoder::decodeFrame(size_t frameNo, VideoFrame& out, std::string
     out.height = gInfo.height;
     out.frameNo = frameNo;
     const size_t need = gInfo.width * gInfo.height * 6;
-    if (out.rgb.size() != need) {
+    // 分配余量（64KB）：RED SDK 要求 16 字节对齐且按行对齐的缓冲，奇数高度
+    // （如 2322）时 SDK 内部行填充可能向缓冲末尾之外写入 w×6×补齐行字节
+    // （堆越界 → 数小时后随机 SIGSEGV）。余量 + 哨兵校验用于证实/排除。
+    const size_t guard = 65536;
+    const size_t alloc = need + guard;
+    if (out.rgb.size() != alloc) {
         try {
-            out.rgb.resize(need, 16);
+            out.rgb.resize(alloc, 16);
         } catch (const std::bad_alloc&) {
             err = "内存不足 (OOM) at frame " + std::to_string(frameNo);
             return false;
@@ -302,17 +308,27 @@ bool SequentialDecoder::decodeFrame(size_t frameNo, VideoFrame& out, std::string
             return false;
         }
     }
+    // 哨兵：解码前在 need 边界处填特征值，解码后检查是否被 SDK 改写
+    uint8_t* const sentinel = static_cast<uint8_t*>(out.rgb.data()) + need;
+    const uint64_t sentinelVal = 0xA55A5AA55AA55A5AULL;
+    memcpy(sentinel, &sentinelVal, sizeof(sentinelVal));
 
     R3DSDK::VideoDecodeJob job;
     job.Mode = R3DSDK::DECODE_FULL_RES_PREMIUM;
     job.PixelType = R3DSDK::PixelType_16Bit_RGB_Planar;
     job.OutputBuffer = out.rgb.data();
-    job.OutputBufferSize = out.rgb.size();
+    job.OutputBufferSize = static_cast<uint64_t>(alloc);  // 允许 SDK 用余量
     job.ImageProcessing = gIp;
 
     if (clip->DecodeVideoFrame(frameNo, job) != R3DSDK::DSDecodeOK) {
         err = "video decode failed at frame " + std::to_string(frameNo);
         return false;
+    }
+    // 哨兵检查：被改写 = SDK 越界写（记录一次，不阻塞解码）
+    if (memcmp(sentinel, &sentinelVal, sizeof(sentinelVal)) != 0) {
+        fprintf(stderr, "[SDK越界] frame %zu: RED SDK 写越过了 w*h*6 缓冲边界 "
+                        "(需增大余量或按 SDK 要求对齐)\n",
+                frameNo);
     }
     return true;
 }
@@ -386,6 +402,61 @@ bool SequentialDecoder::decodeAudioWindow(unsigned long long targetSamples,
     return true;
 }
 
+bool SequentialDecoder::discardAudioTo(unsigned long long sample, std::string& err)
+{
+    // 续传：解码目标采样号之前的音频块并直接丢弃（不经过队列，避免阻塞死锁）。
+    // 音频解码便宜，重解少量块可接受。
+    if (!audioOn_)
+        return true;
+    R3DSDK::Clip* clip = static_cast<R3DSDK::Clip*>(clip_);
+    const size_t needBlock = gInfo.audio.maxBlockBytes;
+    if (needBlock > audioBlockBuf_.size())
+        audioBlockBuf_.resize(needBlock, 512);
+    // 与其他两个解码路径一致的 OOM 防护：缓冲分配失败时 data() 为 nullptr，
+    // 直接把 nullptr 传给 DecodeAudioBlock 会段错误（续传 seek 是恢复的第一
+    // 步，必须以干净错误失败而不是崩溃）
+    if (needBlock > 0 && !audioBlockBuf_.data()) {
+        err = "内存不足 (OOM)";
+        return false;
+    }
+    while (audioBlockIdx_ < gInfo.audio.blockCount &&
+           decodedSamples_ < sample) {
+        size_t bufSize = gInfo.audio.maxBlockBytes;
+        if (clip->DecodeAudioBlock(audioBlockIdx_, audioBlockBuf_.data(), &bufSize) !=
+            R3DSDK::DSDecodeOK) {
+            err = "audio decode failed at block " + std::to_string(audioBlockIdx_);
+            return false;
+        }
+        if (bufSize > gInfo.audio.maxBlockBytes || bufSize % 4 != 0) {
+            err = "audio decode returned invalid size at block " +
+                  std::to_string(audioBlockIdx_);
+            return false;
+        }
+        size_t words = bufSize / 4;
+        ++audioBlockIdx_;
+        if (words == 0)
+            continue;
+        // 与 decodeAudioWindow/decodeOneAudioBlock 一致的声道对齐校验：
+        // 不对齐时静默取整会让续传起点偏移 <channels 个采样（轻微重复）。
+        // 正常剪辑不可达（同样的问题会在正常解码路径报错），仅防御一致。
+        if (gInfo.audio.channels <= 0 ||
+            words % static_cast<size_t>(gInfo.audio.channels) != 0) {
+            err = "audio block size not aligned to channels at block " +
+                  std::to_string(audioBlockIdx_ - 1);
+            return false;
+        }
+        const size_t blockSamples =
+            words / static_cast<size_t>(gInfo.audio.channels);
+        decodedSamples_ += blockSamples;
+    }
+    return true;
+}
+
+bool SequentialDecoder::seekAudioTo(unsigned long long sample, std::string& err)
+{
+    return discardAudioTo(sample, err);
+}
+
 bool SequentialDecoder::drainAudio(AudioQueue& audio,
                                    unsigned long long targetSamplesLimit,
                                    std::string& err)
@@ -396,6 +467,80 @@ bool SequentialDecoder::drainAudio(AudioQueue& audio,
            decodedSamples_ < targetSamplesLimit) {
         if (!decodeAudioWindow(targetSamplesLimit, audio, err))
             return false;
+    }
+    return true;
+}
+
+// 单块音频解码：生成 ≤1 个音频块（供收尾"解一块写一块"——AudioQueue 容量
+// 有限，drainAudio 一次生成大量块会因队列满而单线程死锁）
+bool SequentialDecoder::decodeOneAudioBlock(AudioQueue& audio,
+                                            unsigned long long targetSamples,
+                                            std::string& err)
+{
+    if (!audioOn_)
+        return false;  // 无音频：完成
+    if (audioBlockIdx_ >= gInfo.audio.blockCount ||
+        decodedSamples_ >= targetSamples)
+        return false;  // 无更多块：完成（err 为空）
+    R3DSDK::Clip* clip = static_cast<R3DSDK::Clip*>(clip_);
+    const size_t needBlock = gInfo.audio.maxBlockBytes;
+    if (needBlock > audioBlockBuf_.size())
+        audioBlockBuf_.resize(needBlock, 512);
+    const size_t needRepack = (needBlock / 4) * 3;
+    if (needRepack > audioRepack_.size()) {
+        try {
+            audioRepack_.resize(needRepack);
+        } catch (const std::bad_alloc&) {
+            err = "内存不足 (OOM)";
+            return false;
+        }
+    }
+    if (needBlock > 0 && !audioBlockBuf_.data()) {
+        err = "内存不足 (OOM)";
+        return false;
+    }
+    size_t bufSize = gInfo.audio.maxBlockBytes;
+    if (clip->DecodeAudioBlock(audioBlockIdx_, audioBlockBuf_.data(), &bufSize) !=
+        R3DSDK::DSDecodeOK) {
+        err = "audio decode failed at block " + std::to_string(audioBlockIdx_);
+        return false;
+    }
+    if (bufSize > gInfo.audio.maxBlockBytes || bufSize % 4 != 0) {
+        err = "audio decode returned invalid size at block " +
+              std::to_string(audioBlockIdx_);
+        return false;
+    }
+    size_t words = bufSize / 4;
+    ++audioBlockIdx_;
+    if (words == 0)
+        return true;  // 空块：继续下一块
+    if (gInfo.audio.channels <= 0 ||
+        words % static_cast<size_t>(gInfo.audio.channels) != 0) {
+        err = "audio block size not aligned to channels at block " +
+              std::to_string(audioBlockIdx_ - 1);
+        return false;
+    }
+    size_t outBytes =
+        repack24beToS24le(audioBlockBuf_.data(), words, audioRepack_.data());
+    AudioPacket p;
+    try {
+        p.bytes.assign(audioRepack_.data(), audioRepack_.data() + outBytes);
+    } catch (const std::bad_alloc&) {
+        err = "内存不足 (OOM)";
+        return false;
+    }
+    p.firstSample = decodedSamples_;
+    // 与 drainAudio/discardAudioTo 一致：decodedSamples_ 是每声道采样数
+    // （words = 全部声道的 32 位字）。此前误用 words 会使立体声下采样号
+    // 虚增 2 倍：收尾/续传的音频 pts 错位、目标限制提前到达（音频截半）。
+    decodedSamples_ += words / static_cast<size_t>(gInfo.audio.channels);
+    try {
+        audio.push(std::move(p));
+    } catch (const std::bad_alloc&) {
+        // 与 decodeAudioWindow 一致：队列满/OOM 必须转为干净错误，
+        // 否则异常逃逸到 main → std::terminate
+        err = "内存不足 (OOM)";
+        return false;
     }
     return true;
 }
@@ -447,6 +592,15 @@ public:
     {
         return audio_.drainAudio(audio, targetSamplesLimit, err);
     }
+    bool decodeOneAudioBlock(AudioQueue& audio, unsigned long long targetSamples,
+                             std::string& err)
+    {
+        return audio_.decodeOneAudioBlock(audio, targetSamples, err);
+    }
+    bool seekAudioTo(unsigned long long sample, std::string& err)
+    {
+        return audio_.seekAudioTo(sample, err);
+    }
     void close();
 
 private:
@@ -458,13 +612,16 @@ private:
         int fd = -1;          // 管道读端（父进程）
         pid_t pid = -1;
         bool dead = false;
+        std::string exitDetail;  // worker 退出信号/码（markDead 记录）
     };
 
     std::mutex m_;
     std::condition_variable cv_;
     std::vector<Worker> workers_;
+    std::vector<size_t> received_;  // 每 worker 已收到的帧数（帧号校验）
     std::map<size_t, VideoFrame> ready_;   // 已到达但尚未按序消费的帧
     size_t nWorkers_ = 8;
+    size_t start_ = 0;                     // 续传：解码起始帧
     size_t width_ = 0, height_ = 0;
     size_t frameSize_ = 0;
     bool fail_ = false;
@@ -522,6 +679,10 @@ std::vector<std::string> workerArgs(const CliOptions& opt, size_t id,
     a.push_back(std::to_string(count));
     a.push_back("--worker-frames");
     a.push_back(std::to_string(total));
+    if (opt.workerStart > 0) {
+        a.push_back("--worker-start");
+        a.push_back(std::to_string(opt.workerStart));
+    }
     a.push_back("--decode");
     a.push_back("cpu");
     if (opt.kelvin != 0) {
@@ -578,10 +739,13 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
     const size_t want = opt.cpuWorkers > 0 ? static_cast<size_t>(opt.cpuWorkers) : 8;
     const size_t n = frames == 0 ? 1 : (frames < want ? frames : want);
     nWorkers_ = n;
+    start_ = opt.workerStart > 0 ? static_cast<size_t>(opt.workerStart) : 0;
+    received_.assign(nWorkers_, 0);
 
     for (size_t k = 0; k < nWorkers_; ++k) {
         int fds[2];
-        if (pipe(fds) != 0) {
+        // O_CLOEXEC：防止 worker 继承其他 worker 的管道读端（fd 泄漏/误用）
+        if (pipe2(fds, O_CLOEXEC) != 0) {
             err = "pipe 创建失败: " + std::string(strerror(errno));
             return false;
         }
@@ -631,10 +795,13 @@ bool CpuAsyncDecoderImpl::waitFrame(size_t frameNo, VideoFrame& out,
                 err = failMsg_;
                 return false;
             }
-            const size_t w = frameNo % nWorkers_;
+            const size_t w = frameNo >= start_ ? (frameNo - start_) % nWorkers_ : 0;
             if (workers_[w].dead) {
                 err = "解码 worker " + std::to_string(w) + " 提前退出（帧 " +
-                      std::to_string(frameNo) + " 未产出）";
+                      std::to_string(frameNo) + " 未产出）" +
+                      (workers_[w].exitDetail.empty()
+                           ? ""
+                           : " [" + workers_[w].exitDetail + "]");
                 fail_ = true;
                 failMsg_ = err;
                 return false;
@@ -706,6 +873,28 @@ bool CpuAsyncDecoderImpl::readWorkerFrame(size_t idx, std::string& err)
               std::to_string(frameSize_) + ")";
         return false;
     }
+    // 校验帧号 = 该 worker 应产出的下一帧（start_ + idx + 已收帧数×nWorkers_）：
+    // 坏帧号会让 ready_ 滞留 57.5MB/帧（内存膨胀）或把错误帧喂给 x265（错帧链）
+    bool badFrame = false;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        const size_t expect =
+            start_ + idx + received_[idx] * workers_.size();
+        if (no != expect) {
+            // 锁内不能调 markDead：markDead 会再次加 m_（非递归互斥 → 自死锁
+            // EDEADLK → std::system_error 未捕获 → std::terminate）。先记录
+            // 错误，释放锁后再标记 worker 死亡。
+            err = "worker " + std::to_string(idx) + " 帧号乱序（收到 " +
+                  std::to_string(no) + "，期望 " + std::to_string(expect) + "）";
+            badFrame = true;
+        } else {
+            ++received_[idx];
+        }
+    }
+    if (badFrame) {
+        markDead(idx);
+        return false;
+    }
     VideoFrame f;
     f.width = width_;
     f.height = height_;
@@ -736,7 +925,15 @@ void CpuAsyncDecoderImpl::markDead(size_t idx)
     }
     w.dead = true;
     int st = 0;
-    waitpid(w.pid, &st, WNOHANG);
+    if (w.pid > 0 && waitpid(w.pid, &st, WNOHANG) == w.pid) {
+        // 记录退出信号/码（SIGSEGV=139 等），供错误信息区分崩溃原因
+        if (WIFSIGNALED(st))
+            w.exitDetail = "signal " + std::to_string(WTERMSIG(st));
+        else if (WIFEXITED(st))
+            w.exitDetail = "exit " + std::to_string(WEXITSTATUS(st));
+        else
+            w.exitDetail = "unknown status";
+    }
     cv_.notify_all();
 }
 
@@ -802,6 +999,20 @@ bool CpuAsyncDecoder::drainAudio(AudioQueue& audio,
                         ->drainAudio(audio, targetSamplesLimit, err);
 }
 
+bool CpuAsyncDecoder::decodeOneAudioBlock(AudioQueue& audio,
+                                          unsigned long long targetSamples,
+                                          std::string& err)
+{
+    return impl_ && static_cast<CpuAsyncDecoderImpl*>(impl_)
+                        ->decodeOneAudioBlock(audio, targetSamples, err);
+}
+
+bool CpuAsyncDecoder::seekAudioTo(unsigned long long sample, std::string& err)
+{
+    return impl_ && static_cast<CpuAsyncDecoderImpl*>(impl_)
+                        ->seekAudioTo(sample, err);
+}
+
 void CpuAsyncDecoder::close()
 {
     if (impl_) {
@@ -838,13 +1049,16 @@ int runDecodeWorker(const CliOptions& opt)
     }
 
     const size_t total = static_cast<size_t>(opt.workerFrames);
+    const size_t start = opt.workerStart > 0 ? static_cast<size_t>(opt.workerStart) : 0;
     const size_t id = static_cast<size_t>(opt.workerId);
     const size_t n = static_cast<size_t>(opt.workerCount);
     const size_t frameSize = info.width * info.height * 6;
     const int outFd = 3;
 
-    for (size_t f = id; f < total; f += n) {
-        VideoFrame fr;
+    // 续传：从 start 帧开始（REDCODE 帧内压缩，DecodeVideoFrame 支持任意帧号直接解码）。
+    // fr 提到循环外复用缓冲（每帧 57.5MB 新建/释放是 mmap 抖动，压力下分配失败→worker 退出）
+    VideoFrame fr;
+    for (size_t f = start + id; f < total; f += n) {
         if (!dec.decodeFrame(f, fr, err)) {
             fprintf(stderr, "worker %ld: 解码失败: %s\n", opt.workerId,
                     err.c_str());

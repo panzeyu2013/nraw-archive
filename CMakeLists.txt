@@ -79,4 +79,6 @@ if(BUILD_TESTING)
 
     add_test(NAME encode_roundtrip
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_roundtrip.sh $<TARGET_FILE:nraw_test_encode>)
+    # 死锁/挂死回归时不让 CI 无限等待
+    set_tests_properties(encode_roundtrip PROPERTIES TIMEOUT 600)
 endif()

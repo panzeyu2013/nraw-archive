@@ -21,18 +21,22 @@ namespace nraw {
 
 namespace {
 
-const char* g_cleanPath1 = nullptr;
+// 中断时保留输出部分产物（.part/.samples/.ckpt）供下次运行自动续传，
+// 只清理 sidecar 临时文件与测试参考文件
 const char* g_cleanPath2 = nullptr;
 const char* g_cleanPath3 = nullptr;
 
 void onSignal(int)
 {
-    if (g_cleanPath1)
-        unlink(g_cleanPath1);
+    // 输出部分产物不删除：它们是断点续传的资产
     if (g_cleanPath2)
         unlink(g_cleanPath2);
     if (g_cleanPath3)
         unlink(g_cleanPath3);
+    const char msg[] =
+        "\n已中断：保留部分产物（.part/.samples/.ckpt），下次运行将自动续传\n";
+    const ssize_t wr = write(2, msg, sizeof(msg) - 1);
+    (void)wr;
     _exit(130);
 }
 
@@ -199,7 +203,11 @@ void printHelp()
     printf("  --buffers <N>           帧队列深度 (默认 16)\n");
     printf("  --frames <N>            仅处理前 N 帧 (默认 -1=全部)\n");
     printf("  --no-audio              不写入音频\n");
-    printf("  --faststart             启用 faststart (moov 前置)\n");
+    printf("  --faststart             输出 moov 前置的 MOV (收尾时重写)；默认 moov 在文件尾\n");
+    printf("  (任何阶段失败都会保留 .part 部分产物，错误信息含路径、errno 与抢救提示；\n");
+    printf("   下次运行自动检测到 .part+检查点即自动续传（源文件与编码参数经\n");
+    printf("   SHA-256 校验一致后复用已编码数据），closed-GOP 关键帧对齐、\n");
+    printf("   open-GOP 回退 17 帧继续，已编码部分不重新编码)\n");
     printf("  --no-sidecar            不生成 .sidecar.json\n");
     printf("  --dump-ref <file>       输出 YUV420P10LE 参考数据后退出 (测试用)\n");
     printf("  --sdk-path <dir>        包含 RED*.so 的目录 (默认程序所在目录)\n");
@@ -237,6 +245,8 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         {"decode-worker",   required_argument, nullptr, 'W'},
         {"worker-count",    required_argument, nullptr, 'Y'},
         {"worker-frames",   required_argument, nullptr, 'Z'},
+        {"worker-start",    required_argument, nullptr, 'R'},
+        {"test-stop-after", required_argument, nullptr, 'T'},
         {"version",         no_argument,       nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -431,6 +441,11 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
             break;
         }
         case 'Y': {
+            if (!opt.decodeWorker) {
+                fprintf(stderr,
+                        "错误: --worker-count 是内部参数，仅用于 --decode-worker 子进程\n");
+                return 1;
+            }
             long v;
             if (!parseLong(optarg, v) || v < 1 || v > 256) {
                 fprintf(stderr, "无效的 --worker-count 值: %s\n", optarg);
@@ -440,12 +455,40 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
             break;
         }
         case 'Z': {
+            if (!opt.decodeWorker) {
+                fprintf(stderr,
+                        "错误: --worker-frames 是内部参数，仅用于 --decode-worker 子进程\n");
+                return 1;
+            }
             long v;
             if (!parseLong(optarg, v) || v < 0 || v > 1000000000L) {
                 fprintf(stderr, "无效的 --worker-frames 值: %s\n", optarg);
                 return 1;
             }
             opt.workerFrames = v;
+            break;
+        }
+        case 'R': {
+            if (!opt.decodeWorker) {
+                fprintf(stderr,
+                        "错误: --worker-start 是内部参数，仅用于 --decode-worker 子进程\n");
+                return 1;
+            }
+            long v;
+            if (!parseLong(optarg, v) || v < 0 || v > 1000000000L) {
+                fprintf(stderr, "无效的 --worker-start 值: %s\n", optarg);
+                return 1;
+            }
+            opt.workerStart = v;
+            break;
+        }
+        case 'T': {
+            long v;
+            if (!parseLong(optarg, v) || v < 0 || v > 1000000000L) {
+                fprintf(stderr, "无效的 --test-stop-after 值: %s\n", optarg);
+                return 1;
+            }
+            opt.testStopAfter = v;
             break;
         }
         case 'h':
@@ -723,6 +766,32 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         dec.close();
         return 4;
     }
+    // 会话打开后立即写初始检查点（与 GPU 路径 encodeRun 一致）；
+    // waitHash=false 不阻塞编码（sha 可能为空，detectResume 跳过校验）
+    {
+        std::string cerr_;
+        nraw::writeCheckpoint(opt.output + ".ckpt", opt, info,
+                              *nraw::g_sampleLog, cerr_, false);
+    }
+
+    // 续传：重放旧 .part 已编码样本 + 音频跳到续传点
+    const size_t startFrame = opt.resumeMode && opt.resumeFrame > 0
+                                  ? static_cast<size_t>(opt.resumeFrame)
+                                  : 0;
+    if (startFrame > 0) {
+        if (!enc.replayOldSamples(opt.output + ".part.old", err)) {
+            fprintf(stderr, "\n续传重放失败: %s\n", err.c_str());
+            dec.close();
+            return 4;
+        }
+        printf("续传: 已复用 %zu 帧已编码数据，从第 %zu 帧继续\n",
+               enc.replayedFrames(), startFrame);
+        if (!dec.seekAudioTo(opt.resumeAudioSample, err)) {
+            fprintf(stderr, "\n续传音频跳转失败: %s\n", err.c_str());
+            dec.close();
+            return 4;
+        }
+    }
 
     // 音频写入上限 = min(视频实际编码帧数对应的采样数, 剪辑自身音频采样数)，
     // 防止音视频时长失配（如 --frames 截断或音频长于视频）时写入超出视频长度
@@ -754,9 +823,11 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
     // 多进程 CPU 解码：worker 子进程自主解码并通过管道流式回传，
     // waitFrame 按帧号排序取帧，解码与 x265 编码流水线重叠。
     bool ok = true;
+    size_t flushCounter = 0;
+    size_t ckCounter = 0;
     auto tStart = std::chrono::steady_clock::now();
     auto tLast = tStart;
-    for (size_t done = 0; done < frameCount; ++done) {
+    for (size_t done = startFrame; done < frameCount; ++done) {
         unsigned long long target =
             static_cast<unsigned long long>(done + 1) *
             static_cast<unsigned long long>(info.audio.sampleRate) *
@@ -784,6 +855,34 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
             ok = false;
             break;
         }
+        // 样本日志每 20 帧 flushSamples（SIGINT 时 stdio 缓冲会丢）；检查点 500 帧
+        if (++flushCounter >= 20) {
+            flushCounter = 0;
+            enc.flushSamples();
+        }
+        if (++ckCounter >= 500) {
+            ckCounter = 0;
+            std::string cerr_;
+            // waitHash=false：不阻塞编码等哈希（收尾 sidecar 记录完整 sha）
+            nraw::writeCheckpoint(opt.output + ".ckpt", opt, info,
+                                  *nraw::g_sampleLog, cerr_, false);
+        }
+        if (opt.testStopAfter >= 0 &&
+            done + 1 - startFrame >= static_cast<size_t>(opt.testStopAfter)) {
+            // 测试钩子：模拟中断（保留 .part/.samples/.ckpt 供续传测试）。
+            // 与 encodeRun 一致：先 flushEnc 冲刷编码器挂起帧（lookahead
+            // 中的帧包此刻才产出），否则中断产物缺挂起帧、续传点检测不到
+            // 新关键帧
+            std::string ferr;
+            enc.flushEnc(ferr);
+            enc.flushSamples();
+            std::string cerr_;
+            nraw::writeCheckpoint(opt.output + ".ckpt", opt, info,
+                                  *nraw::g_sampleLog, cerr_, false);
+            fprintf(stderr, "\n[测试] 模拟中断（保留部分产物供续传测试）\n");
+            ok = false;
+            break;
+        }
 
         auto now = std::chrono::steady_clock::now();
         if (now - tLast >= std::chrono::seconds(2)) {
@@ -798,12 +897,25 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
     }
 
     if (ok) {
-        if (!dec.drainAudio(audio, limit, err)) {
-            fprintf(stderr, "\n解码失败: %s\n", err.c_str());
-            ok = false;
-        } else if (!flushAudio()) {
-            fprintf(stderr, "\n处理失败: %s\n", err.c_str());
-            ok = false;
+        // 防御性收尾：逐帧循环的最后一个 target 已把解码推进到 limit（或
+        // 剪辑音频末尾），正常路径此处立即返回；仅当未来逐帧解码窗口改变、
+        // 解码器未追平时，此循环才真正补解码（解一块写一块，队列 ≤1 块，
+        // 避免 drainAudio 一次生成大量块在单线程下因队列满而自死锁）
+        for (;;) {
+            std::string aerr;
+            const bool more = dec.decodeOneAudioBlock(audio, limit, aerr);
+            if (!aerr.empty()) {
+                fprintf(stderr, "\n解码失败: %s\n", aerr.c_str());
+                ok = false;
+                break;
+            }
+            if (!flushAudio()) {
+                fprintf(stderr, "\n处理失败: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+            if (!more)
+                break;  // 解码完成
         }
     }
 
@@ -845,7 +957,26 @@ int runGpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount,
     std::thread encTh(encodeRun, opt, info, std::ref(frames), std::ref(audio),
                       std::ref(abort), std::ref(failDetail));
 
-    if (!gpu.start(frames, &abort, err)) {
+    // 续传：音频跳到续传点（视频由 gpu.submit(frameNo) 随机访问解码）
+    const size_t startFrame = opt.resumeMode && opt.resumeFrame > 0
+                                  ? static_cast<size_t>(opt.resumeFrame)
+                                  : 0;
+    if (startFrame > 0) {
+        if (!dec.seekAudioTo(opt.resumeAudioSample, err)) {
+            fprintf(stderr, "\n续传音频跳转失败: %s\n", err.c_str());
+            abort.store(true);
+            audio.setEof();
+            frames.setEof();
+            gpu.close();
+            encTh.join();
+            dec.close();
+            return 4;
+        }
+    }
+
+    if (!gpu.start(frames, &abort,
+                    opt.resumeFrame > 0 ? static_cast<size_t>(opt.resumeFrame) : 0,
+                    err)) {
         fprintf(stderr, "\nGPU 管线启动失败: %s\n", err.c_str());
         abort.store(true);
         audio.setEof();
@@ -857,7 +988,7 @@ int runGpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount,
     }
 
     bool ok = true;
-    for (size_t frameNo = 0; frameNo < frameCount; ++frameNo) {
+    for (size_t frameNo = startFrame; frameNo < frameCount; ++frameNo) {
         unsigned long long target =
             static_cast<unsigned long long>(frameNo + 1) *
             static_cast<unsigned long long>(info.audio.sampleRate) *
@@ -878,6 +1009,8 @@ int runGpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount,
             ok = false;
             break;
         }
+        // 检查点由 encodeRun 编码线程独占写入（500 帧周期），此处不写，
+        // 避免与 encTh 并发迭代 g_sampleLog（vector 扩容数据竞争）
     }
 
     if (ok) {
@@ -934,6 +1067,10 @@ int main(int argc, char** argv)
 {
     nraw::installSignalHandlers();
 
+    // 样本日志：编码会话写入，供收尾失败时自动重建 moov
+    nraw::SampleLog sampleLog;
+    nraw::g_sampleLog = &sampleLog;
+
     nraw::CliOptions opt;
     bool wantHelp = false;
     bool wantVersion = false;
@@ -962,10 +1099,9 @@ int main(int argc, char** argv)
     if (opt.decodeWorker)
         return nraw::runDecodeWorker(opt);
 
-    static std::string partPath = opt.output + ".part";
     static std::string sidecarPartPath = opt.output + ".sidecar.json.part";
-    nraw::g_cleanPath1 = partPath.c_str();
-    nraw::g_cleanPath2 = opt.dumpRef.empty() ? nullptr : opt.dumpRef.c_str();
+    static std::string dumpRefPath = opt.dumpRef;  // 拷贝进 static，防 c_str 悬垂
+    nraw::g_cleanPath2 = opt.dumpRef.empty() ? nullptr : dumpRefPath.c_str();
     nraw::g_cleanPath3 = (!opt.noSidecar && opt.dumpRef.empty())
                              ? sidecarPartPath.c_str()
                              : nullptr;
@@ -1036,17 +1172,33 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    std::string inputHash;
     std::thread hashTh;
+    // RAII：任何提前 return 路径都自动 join 哈希线程（不 join 会
+    // std::terminate——"terminate called without an active exception"）
+    struct HashJoinGuard {
+        std::thread& t;
+        ~HashJoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } hashJoinGuard{hashTh};
     const bool needHash = !opt.noSidecar && opt.dumpRef.empty() && !opt.gpuTest;
-    if (needHash)
-        hashTh = std::thread([&] {
-            inputHash = nraw::sha256File(opt.input);
-            if (inputHash.empty())
+    if (needHash) {
+        std::promise<std::string> hp;
+        nraw::g_sourceHashFut = hp.get_future().share();
+        hashTh = std::thread([p = std::move(hp), &opt]() mutable {
+            std::string h;
+            try {
+                h = nraw::sha256File(opt.input);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "警告: 源文件 sha256 计算异常: %s\n", e.what());
+            }
+            if (h.empty())
                 fprintf(stderr, "警告: 无法计算源文件 sha256（读取失败），"
                                  "sidecar 将记录空哈希\n");
+            p.set_value(h);  // 异常也 set（空串），避免 get() 抛 future_error
         });
-
+    }
     printf("输入: %s\n输出: %s\n", opt.input.c_str(), opt.output.c_str());
     printf("SDK 版本: %s\n", nraw::sdkVersion().c_str());
     printf("分辨率: %zux%zu  帧数: %zu  帧率: %zu/%zu\n",
@@ -1078,8 +1230,8 @@ int main(int argc, char** argv)
             if (forcedGpu) {
                 fprintf(stderr, "GPU 路径初始化失败: %s\n", err.c_str());
                 gpuPipe.close();
-                if (needHash)
-                    hashTh.join();
+                if (needHash && nraw::g_sourceHashFut.valid())
+                    (void)nraw::g_sourceHashFut.get();  // 等哈希线程结束，防泄漏
                 nraw::closeMedia();
                 nraw::shutdownSdk();
                 return 2;
@@ -1129,6 +1281,155 @@ int main(int argc, char** argv)
         printf("解码路径: CPU（--decode cpu）\n");
     }
 
+    // 清理 purgePartFile 中途被杀可能残留的 .purging 临时文件
+    remove((opt.output + ".part.purging").c_str());
+
+    // 源文件哈希在后台并行计算（编码不阻塞）：detectResume 校验
+    // ck.sourceSha256 vs opt.sourceSha256——有 .part（续传候选）时在此
+    // 等待哈希完成（全新编码无 .part 不等，避免 270GB 哈希阻塞启动）
+    if (needHash && nraw::g_sourceHashFut.valid()) {
+        struct stat stb;
+        if (stat((opt.output + ".part").c_str(), &stb) == 0)
+            opt.sourceSha256 = nraw::g_sourceHashFut.get();
+    }
+
+    // ---- 断点续传自动检测 ----
+    std::string resumeMsg;
+    int rdet = 0;
+    if (opt.dumpRef.empty() && !opt.gpuTest && !opt.decodeWorker) {
+        rdet = nraw::detectResume(opt, info, resumeMsg);
+        if (rdet == 0) {
+            // 续传轮转窗口恢复：rename(.part→.part.old) 之后、新 .part 落盘
+            // 完整样本之前崩溃（purge 全程 + 重放开头，分钟级窗口）→ 只剩
+            // .part.old + .samples/.ckpt。此时若直接删 .part.old 会把数小时
+            // 成果抹掉——rename 回退为 .part 再重新检测续传。
+            struct stat stb;
+            const bool hasOld =
+                stat((opt.output + ".part.old").c_str(), &stb) == 0;
+            const bool hasPart =
+                stat((opt.output + ".part").c_str(), &stb) == 0;
+            if (hasOld && !hasPart) {
+                if (rename((opt.output + ".part.old").c_str(),
+                           (opt.output + ".part").c_str()) == 0) {
+                    fprintf(stderr, "恢复: 检测到未完成的续传（.part.old 存在、"
+                                    ".part 缺失），已回退为 .part 并重新检测\n");
+                    rdet = nraw::detectResume(opt, info, resumeMsg);
+                } else {
+                    fprintf(stderr, "警告: 无法回退 .part.old（%s），保留原文件\n",
+                            strerror(errno));
+                }
+            } else if (hasOld) {
+                // .part 与 .part.old 并存，但 rdet==0 说明当前 .part 无完整
+                // 样本或不足一个完整关键帧（上一轮续传在重放早期崩溃，.part
+                // 只是空壳/残缺前缀）：此时 .part.old 是上一轮的全部成果，且
+                // .samples/.ckpt 仍与其一致——直接删除会把数小时编码成果抹掉。
+                // 回退 .part.old（原子覆盖空壳 .part）再重新检测续传。
+                if (rename((opt.output + ".part.old").c_str(),
+                           (opt.output + ".part").c_str()) == 0) {
+                    fprintf(stderr, "恢复: 检测到 .part 无有效进度且存在 .part.old，"
+                                    "已回退为 .part 并重新检测\n");
+                    rdet = nraw::detectResume(opt, info, resumeMsg);
+                } else {
+                    fprintf(stderr, "警告: 无法回退 .part.old（%s），保留原文件\n",
+                            strerror(errno));
+                }
+            }
+        } else if (rdet == 2) {
+            fprintf(stderr, "\n错误: %s\n", resumeMsg.c_str());
+            gpuPipe.close();
+            nraw::closeMedia();
+            nraw::shutdownSdk();
+            return 4;
+        }
+        if (rdet == 1) {
+            printf("续传: %s\n", resumeMsg.c_str());
+            if (opt.sourceSha256.empty())
+                fprintf(stderr, "警告: 源文件 SHA-256 为空（--no-sidecar 或哈希失败），"
+                                 "本次续传未校验源文件未变\n");
+            // 加载样本日志供重放，并丢弃续传点之后的旧视频条目
+            // （其数据将被重新编码，不在新 .part 中；保留会导致重放/重建布局错位）
+            std::string lerr;
+            if (!nraw::g_sampleLog->loadFrom(opt.output + ".samples", lerr)) {
+                fprintf(stderr, "\n错误: 样本日志加载失败: %s\n", lerr.c_str());
+                gpuPipe.close();
+                nraw::closeMedia();
+                nraw::shutdownSdk();
+                return 4;
+            }
+            // 日志截断到 .part 实际完整的前缀（countCompleteSamples 语义）：
+            // 掉电/截断时 .samples 可能比 .part 持久化得更靠前（日志有条目、
+            // 数据未落盘）。若只按 purgeVideoFrom 清视频，截断点之后的音频
+            // 幻影条目会留在日志里、排序后混入保留区，重放按顺序累计偏移
+            // 读到错误字节 → 静默损坏。截断后音视频条目与 .part 一一对应。
+            {
+                const size_t complete = nraw::countCompleteSamples(
+                    opt.output + ".part", *nraw::g_sampleLog);
+                if (complete < nraw::g_sampleLog->entries.size())
+                    nraw::g_sampleLog->entries.resize(complete);
+            }
+            // 旧 .part 改名为 .part.old 作为只读数据源，会话写规范的 .part：
+            // 续传再失败时 .part/.samples/.ckpt 保持自洽，可再次续传。
+            // 注意顺序：
+            //  1) purgePartFile 的 origOff 必须按原始（提交顺序 = .part 物理布局）
+            //     累计"全部条目"（含将被丢弃的视频帧），故必须先于
+            //     purgeVideoFrom 调用，否则偏移漏掉被丢弃条目的数据 → 读错位；
+            //  2) purgeVideoFrom 再裁剪内存日志（视频 >= 续传点）；
+            //  3) 最后按 (dts, 视频在前) 排序，与 purge 输出 / 重放顺序一致。
+            const std::string oldPart = opt.output + ".part";
+            const std::string oldPartBak = opt.output + ".part.old";
+            // 不预先 remove：POSIX rename 原子覆盖旧 .part.old——
+            // 预删会扩大"无任何备份"的瞬时窗口（配合 S1 恢复逻辑）
+            if (rename(oldPart.c_str(), oldPartBak.c_str()) != 0) {
+                fprintf(stderr, "\n错误: 无法备份旧 .part: %s\n", oldPart.c_str());
+                gpuPipe.close();
+                nraw::closeMedia();
+                nraw::shutdownSdk();
+                return 4;
+            }
+            {
+                std::string perr;
+                if (!nraw::purgePartFile(
+                        oldPartBak, *nraw::g_sampleLog,
+                        static_cast<int64_t>(opt.resumeFrame), perr, false)) {
+                    fprintf(stderr, "\n错误: 清理旧 .part 失败: %s\n", perr.c_str());
+                    gpuPipe.close();
+                    nraw::closeMedia();
+                    nraw::shutdownSdk();
+                    return 4;
+                }
+            }
+            nraw::g_sampleLog->purgeVideoFrom(
+                static_cast<int64_t>(opt.resumeFrame));
+            // 按 (dts, 视频在前) 排序：与 purge 输出 / 重放顺序一致
+            std::stable_sort(nraw::g_sampleLog->entries.begin(),
+                             nraw::g_sampleLog->entries.end(),
+                             [](const nraw::SampleLog::Entry& a,
+                                const nraw::SampleLog::Entry& b) {
+                                 if (a.dts != b.dts)
+                                     return a.dts < b.dts;
+                                 return a.video && !b.video;
+                             });
+            // 立即把排序后的日志持久化到 .samples：purgePartFile 已把
+            // .part.old 改写为排序布局，但磁盘 .samples 此刻仍是旧的提交序
+            // 日志（要等 openSession 才重写）。若在此窗口崩溃（SIGINT/_exit），
+            // 下次运行 S1 恢复会把"排序的 .part"与"提交序 .samples"配对，
+            // countCompleteSamples/purge/重放按提交序累计偏移读取排序文件 →
+            // 静默写入垃圾帧（无任何报错）。saveTo 保证磁盘状态自洽；写入
+            // 撕裂安全：loadFrom 容忍截断，且排序日志前缀与排序文件前缀
+            // 偏移一致，续传只会从更早的关键帧开始。
+            {
+                std::string serr;
+                if (!nraw::g_sampleLog->saveTo(opt.output + ".samples", serr)) {
+                    fprintf(stderr, "\n错误: 续传日志持久化失败: %s\n", serr.c_str());
+                    gpuPipe.close();
+                    nraw::closeMedia();
+                    nraw::shutdownSdk();
+                    return 4;
+                }
+            }
+        }
+    }
+
     int rc = 0;
     if (useGpu) {
         rc = nraw::runGpuPath(opt, info, frameCount, gpuPipe);
@@ -1154,8 +1455,18 @@ int main(int argc, char** argv)
         rc = nraw::runCpuPath(opt, info, frameCount);
     }
     gpuPipe.close();
-    if (needHash)
-        hashTh.join();
+
+    if (rc == 0 && opt.dumpRef.empty()) {
+        // 成功后清理续传检查点与样本日志（新输出已 rename 到最终路径）
+        remove((opt.output + ".samples").c_str());
+        remove((opt.output + ".ckpt").c_str());
+        // 续传成功后旧 .part 数据源（.part.old）残留：必须删除，
+        // 否则下次运行 detectResume 会因"有 .part 无检查点"而拒绝执行
+        if (opt.resumeMode) {
+            remove((opt.output + ".part.old").c_str());
+            remove((opt.output + ".part").c_str());
+        }
+    }
 
     if (rc != 0) {
         if (!opt.dumpRef.empty())
@@ -1166,10 +1477,14 @@ int main(int argc, char** argv)
     }
 
     if (!opt.noSidecar && opt.dumpRef.empty()) {
+        if (needHash && nraw::g_sourceHashFut.valid())
+            opt.sourceSha256 = nraw::g_sourceHashFut.get();  // sidecar 需要 sha256
         nraw::AppliedSettings applied;
         nraw::appliedSettings(applied);
         if (nraw::writeSidecar(opt.output, opt, info, frameCount, applied, gpu,
-                               inputHash, true) != 0) {
+                               nraw::g_sourceHashFut.valid() ? opt.sourceSha256
+                                                             : std::string(),
+                               true) != 0) {
             fprintf(stderr, "\n错误: sidecar 写入失败\n");
             nraw::closeMedia();
             nraw::shutdownSdk();

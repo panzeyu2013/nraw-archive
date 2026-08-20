@@ -17,5 +17,18 @@ ref.yuv
 dec.yuv
 *.yuv
 
+# 断点续传/自动重建的运行时产物（每次编码都会生成，绝不入库）
+*.part
+*.part.old
+*.part.purging
+*.part.sim
+*.recovered
+*.samples
+*.ckpt
+*.ckpt.tmp
+
+# 本地下载的构建依赖包（x265 dev 安装包等，不入库）
+*.deb
+
 # macOS
 .DS_Store
