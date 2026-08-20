@@ -26,7 +26,7 @@ struct AVStream;
 
 namespace nraw {
 
-constexpr const char* kToolVersion = "1.0.0";
+constexpr const char* kToolVersion = "1.1.0";
 
 // 后续结构前向声明（函数签名引用）
 struct CliOptions;
