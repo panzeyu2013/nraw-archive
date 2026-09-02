@@ -28,7 +28,14 @@ for t in ffprobe sha256sum; do
 done
 JQ="$(command -v jq 2>/dev/null || true)"
 
+# sidecar 命名规范：sidecar_<输出基名>.json（如 DSC_1775.mov → sidecar_DSC_1775.json）。
+# 兼容旧命名 <输出>.sidecar.json：优先新命名，找不到再回退旧命名。
 sidecar="$mov.sidecar.json"
+base="$(basename "$mov")"
+sidecar_new="$(dirname "$mov")/sidecar_${base%.*}.json"
+if [ -f "$sidecar_new" ]; then
+    sidecar="$sidecar_new"
+fi
 jf="$(mktemp /tmp/verify_probe_XXXXXX.json 2>/dev/null)" || jf="/tmp/verify_probe_$$.json"
 trap 'rm -f "$jf"' EXIT
 

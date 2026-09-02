@@ -32,7 +32,7 @@ extra=()
 skip_next=0
 skip_drop=0
 last_opt=""
-value_opts="--kelvin --tint --iso --exposure --lens-correction --chroma-nr --decode --crf --preset --keyint --min-keyint --open-gop --pools --cpu-workers --jobs --buffers --frames --sdk-path --output -o"
+value_opts="--kelvin --tint --iso --exposure --lens-correction --chroma-nr --decode --crf --preset --keyint --min-keyint --open-gop --pools --cpu-workers --jobs --buffers --frames --worker-batch --sdk-path --output -o"
 reject_opts="--dump-ref"
 for a in "$@"; do
     if [ "$skip_drop" -eq 1 ]; then
@@ -125,7 +125,8 @@ for f in "${files[@]}"; do
     out="$dir/${base%.*}.h265.mov"
 
     if [ -f "$out" ] && [ "$force" -eq 0 ]; then
-        if [ -f "$out.sidecar.json" ]; then
+        # sidecar 命名：工具只剥最后一个扩展名 → sidecar_<基名>.h265.json
+        if [ -f "$dir/sidecar_${base%.*}.h265.json" ]; then
             echo "[$i/$total] $base ... 已存在 $(basename "$out")，跳过（--force 强制重做）"
             skipped=$((skipped + 1))
             continue

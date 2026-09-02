@@ -4,6 +4,9 @@ build/
 
 # 个人脚本（含绝对路径，不入库）
 scripts/run.sh
+scripts/start_*.sh
+scripts/accept_run.sh
+scripts/exp_rss_monitor.sh
 
 # 第三方闭源 SDK（不随仓库分发，按 README 放置到该目录）
 /R3DSDKv9_2_1/
@@ -13,9 +16,14 @@ scripts/run.sh
 *.h265.mov.part
 *.sidecar.json
 *.sidecar.json.part
+sidecar_*.json
+sidecar_*.json.part
 ref.yuv
 dec.yuv
 *.yuv
+
+# CTest 产物目录
+Testing/
 
 # 断点续传/自动重建的运行时产物（每次编码都会生成，绝不入库）
 *.part

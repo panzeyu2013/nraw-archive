@@ -288,7 +288,8 @@ struct CliOptions {
     long  workerId = 0;              // worker 序号（解码 帧号 ≡ id (mod count)）
     long  workerCount = 1;           // worker 总数
     long  workerFrames = 0;          // 需解码的帧总数（父进程 clamp 后的值）
-    long  workerStart = 0;           // worker 起始帧（续传时跳过已编码部分）
+    long  workerStart = 0;           // 本代起始帧（worker 首帧 = workerStart + id；续传/代际回收时由父进程更新）
+    long  workerBatch = 1000;        // 每代 worker 最多解码的帧数（代际回收：防止闭源 SDK 不可回收内存无限累积）
 
     // 续传（内部，主程序从检查点自动检测并设置）
     bool  resumeMode = false;        // 本次是续传
@@ -484,6 +485,8 @@ std::string sdkVersion();
 bool   openMedia(const std::string& path, const CliOptions& opt, MediaInfo& info, std::string& err);
 bool   appliedSettings(AppliedSettings& out);
 void   closeMedia();
+// 只释放全局 gClip（元数据已读入 gInfo），保留 gIp——worker 消除冗余双 Clip
+void   releaseGlobalClip();
 void*  sharedIpSettings();          // shared IPP2 ImageProcessingSettings* (stable during run)
 
 class SequentialDecoder {
@@ -514,6 +517,7 @@ private:
     size_t audioBlockIdx_ = 0;
     unsigned long long decodedSamples_ = 0;
     AlignedBuffer audioBlockBuf_;        // reusable decode block buffer
+    AlignedBuffer scratch_;              // reusable interleaved decode buffer (decodeFrame)
     std::vector<uint8_t> audioRepack_;   // reusable s24le repack buffer
 };
 

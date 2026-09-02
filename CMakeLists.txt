@@ -12,6 +12,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
 find_package(Threads REQUIRED)
 
+# 可选 OpenSSL：libcrypto 的 SHA-256 在 x86-64 上自动使用 SHA-NI 硬件加速，
+# 续传前对 237GB 源文件的哈希从 ~1 小时（纯软件）降到 ~1 分钟。
+# 找不到时回退到内置纯软件实现（sha256.cpp 内部条件编译）。
+find_package(OpenSSL QUIET)
+
 if(APPLE)
     # macOS 自带 OpenCL.framework（头文件在框架内，无需额外依赖）
     find_library(OPENCL_LIB OpenCL)
@@ -96,7 +101,23 @@ else()
         COMMENT "拷贝 R3D SDK 动态库到可执行文件目录")
 endif()
 
+# OpenSSL（SHA-NI 加速）对所有平台的主目标统一启用（找到才启用，安静失败）
+if(OPENSSL_FOUND)
+    target_link_libraries(nraw_archive PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(nraw_archive PRIVATE NRAW_HAVE_OPENSSL)
+endif()
+
 target_compile_options(nraw_archive PRIVATE -O2 -Wall -Wextra)
+
+# 泄漏定位探针（不参与测试套件；手动运行；依赖 /proc，仅 Linux）
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(nraw_leak_probe tests/leak_probe.cpp)
+    target_include_directories(nraw_leak_probe PRIVATE ${R3D_SDK_ROOT}/Include)
+    target_link_libraries(nraw_leak_probe PRIVATE
+        ${R3D_SDK_ROOT}/Lib/linux64/libR3DSDK-cpp11.a dl pthread m)
+    target_link_options(nraw_leak_probe PRIVATE -no-pie)
+    target_compile_options(nraw_leak_probe PRIVATE -O2 -Wall -Wextra)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -112,6 +133,10 @@ if(BUILD_TESTING)
     )
 
     target_link_libraries(nraw_test_encode PRIVATE PkgConfig::FFMPEG Threads::Threads)
+    if(OPENSSL_FOUND)
+        target_link_libraries(nraw_test_encode PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(nraw_test_encode PRIVATE NRAW_HAVE_OPENSSL)
+    endif()
     target_compile_options(nraw_test_encode PRIVATE -O2 -Wall -Wextra)
 
     add_test(NAME encode_roundtrip

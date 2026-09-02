@@ -19,6 +19,14 @@
 
 namespace nraw {
 
+// 信号处理用的 worker PID 槽（定义在 sdk_decode.cpp 的 nraw namespace）：
+// 主线程 spawn/close 时写入，信号处理器只读——固定数组 + sig_atomic_t
+// 计数保证 async-signal-safe（无锁、无分配）。声明在匿名 namespace 外，
+// onSignal 用 nraw:: 全限定引用。
+extern volatile sig_atomic_t g_workerPidSlots[256];
+extern volatile sig_atomic_t g_workerPidCount;
+constexpr sig_atomic_t kMaxWorkerSlots = 256;
+
 namespace {
 
 // 中断时保留输出部分产物（.part/.samples/.ckpt）供下次运行自动续传，
@@ -33,6 +41,17 @@ void onSignal(int)
         unlink(g_cleanPath2);
     if (g_cleanPath3)
         unlink(g_cleanPath3);
+    // 主动终止 worker 子进程：_exit 不跑析构，worker 会变孤儿（仅靠写管道
+    // EPIPE 退出，延迟 ~1s+）；反复中断叠加会滞留内存。SIGKILL 直接回收。
+    // 只读固定数组 + sig_atomic_t 计数（async-signal-safe，无锁）。
+    // pid <= 0 的槽位跳过：kill(0, SIGKILL) 会杀伤整个进程组
+    // （nohup/脚本链场景下会连带杀死无关进程）。
+    const volatile sig_atomic_t n = nraw::g_workerPidCount;
+    for (volatile sig_atomic_t i = 0; i < n && i < kMaxWorkerSlots; ++i) {
+        const pid_t p = static_cast<pid_t>(nraw::g_workerPidSlots[i]);
+        if (p > 0)
+            kill(p, SIGKILL);
+    }
     const char msg[] =
         "\n已中断：保留部分产物（.part/.samples/.ckpt），下次运行将自动续传\n";
     const ssize_t wr = write(2, msg, sizeof(msg) - 1);
@@ -195,6 +214,7 @@ void printHelp()
     printf("  --min-keyint <N>        最小关键帧间隔 (默认 1)\n");
     printf("  --pools <N>             x265 编码线程池大小 (默认 0=auto，由 --jobs 统一分配)\n");
     printf("  --cpu-workers <N>       CPU 解码 worker 进程数 (默认 0=auto，每个约 ~1fps，8 个≈8fps)\n");
+    printf("  --worker-batch <N>     worker 代际回收批次大小 (默认 1000 帧/代；R3D SDK 解码存在无法在进程内回收的内存积累，worker 每解码 N 帧后干净退出并由父进程重启下一批，内存随进程退出归还)\n");
     printf("  --jobs <N>              CPU 总线程预算 (默认 0=auto=核心数)；自动拆分 worker 数与 x265 pools\n");
     printf("  --open-gop <0|1>        GOP 结构: 1=open(场景切点,默认), 0=closed\n");
     printf("  --buffers <N>           帧队列深度 (默认 16)\n");
@@ -205,7 +225,7 @@ void printHelp()
     printf("   下次运行自动检测到 .part+检查点即自动续传（源文件与编码参数经\n");
     printf("   SHA-256 校验一致后复用已编码数据），closed-GOP 关键帧对齐、\n");
     printf("   open-GOP 回退 17 帧继续，已编码部分不重新编码)\n");
-    printf("  --no-sidecar            不生成 .sidecar.json\n");
+    printf("  --no-sidecar            不生成 sidecar_<输出名>.json\n");
     printf("  --dump-ref <file>       输出 YUV420P10LE 参考数据后退出 (测试用)\n");
     printf("  --sdk-path <dir>        包含 RED*.so 的目录 (默认程序所在目录)\n");
     printf("  --gpu-test              测试 GPU 路径后退出; 无输入文件时仅测初始化+内核编译\n");
@@ -243,6 +263,7 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         {"worker-count",    required_argument, nullptr, 'Y'},
         {"worker-frames",   required_argument, nullptr, 'Z'},
         {"worker-start",    required_argument, nullptr, 'R'},
+        {"worker-batch",    required_argument, nullptr, 'B'},
         {"test-stop-after", required_argument, nullptr, 'T'},
         {"version",         no_argument,       nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
@@ -479,6 +500,15 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
             opt.workerStart = v;
             break;
         }
+        case 'B': {
+            long v;
+            if (!parseLong(optarg, v) || v < 1 || v > 1000000000L) {
+                fprintf(stderr, "无效的 --worker-batch 值: %s\n", optarg);
+                return 1;
+            }
+            opt.workerBatch = v;
+            break;
+        }
         case 'T': {
             long v;
             if (!parseLong(optarg, v) || v < 0 || v > 1000000000L) {
@@ -530,12 +560,34 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
 
 }
 
+// sidecar 路径：sidecar_<输出基名>.json
+// 输出 /path/DSC_1775.mov → /path/sidecar_DSC_1775.json
+// 输出 /path/out（无扩展）→ /path/sidecar_out.json
+std::string sidecarPathFor(const std::string& outPath)
+{
+    const size_t slash = outPath.find_last_of('/');
+    const size_t dot = outPath.find_last_of('.');
+    // 仅当扩展名点位于最后一个路径分隔符之后才剥离（如 .mov/.mp4）
+    const bool hasExt = dot != std::string::npos &&
+                        (slash == std::string::npos || dot > slash);
+    const std::string dir = slash == std::string::npos
+                                ? std::string()
+                                : outPath.substr(0, slash + 1);
+    const std::string name = outPath.substr(
+        slash == std::string::npos ? 0 : slash + 1,
+        (hasExt ? dot : outPath.size()) -
+            (slash == std::string::npos ? 0 : slash + 1));
+    return dir + "sidecar_" + name + ".json";
+}
+
 int writeSidecar(const std::string& outPath, const CliOptions& opt,
                  const MediaInfo& info, size_t framesDone,
                  const AppliedSettings& applied, const GpuStatus& gpu,
                  const std::string& inputHash, bool ok)
 {
-    const std::string sidecarPath = outPath + ".sidecar.json";
+    // sidecar 命名规范：sidecar_<输出基名>.json（如 DSC_1775.mov →
+    // sidecar_DSC_1775.json），与输出文件同目录、不再带 .mov 扩展
+    const std::string sidecarPath = sidecarPathFor(outPath);
     const std::string partPath = sidecarPath + ".part";
     FILE* fp = fopen(partPath.c_str(), "w");
     if (!fp) {
@@ -884,7 +936,11 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         auto now = std::chrono::steady_clock::now();
         if (now - tLast >= std::chrono::seconds(2)) {
             double dt = std::chrono::duration<double>(now - tStart).count();
-            double fps = dt > 0.0 ? static_cast<double>(done + 1) / dt : 0.0;
+            // 续传时 done 是绝对帧号（含已复用旧数据），必须减去 startFrame
+            // 才是本会话实际编码的帧数，否则 fps/ETA 被旧数据虚高
+            double fps = dt > 0.0
+                             ? static_cast<double>(done + 1 - startFrame) / dt
+                             : 0.0;
             fprintf(stderr, "\r%s",
                     nraw::progressLine(done + 1, frameCount, info.fpsNum,
                                        info.fpsDen, fps)
@@ -920,7 +976,10 @@ int runCpuPath(const CliOptions& opt, const MediaInfo& info, size_t frameCount)
         double dt = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - tStart)
                         .count();
-        double fps = dt > 0.0 ? static_cast<double>(frameCount) / dt : 0.0;
+        // 与循环内一致：减去续传起点，fps 只统计本会话编码的帧数
+        double fps = dt > 0.0
+                         ? static_cast<double>(frameCount - startFrame) / dt
+                         : 0.0;
         fprintf(stderr, "\r%s  done.\n",
                 nraw::progressLine(frameCount, frameCount, info.fpsNum,
                                    info.fpsDen, fps)
@@ -1096,7 +1155,7 @@ int main(int argc, char** argv)
     if (opt.decodeWorker)
         return nraw::runDecodeWorker(opt);
 
-    static std::string sidecarPartPath = opt.output + ".sidecar.json.part";
+    static std::string sidecarPartPath = nraw::sidecarPathFor(opt.output) + ".part";
     static std::string dumpRefPath = opt.dumpRef;  // 拷贝进 static，防 c_str 悬垂
     nraw::g_cleanPath2 = opt.dumpRef.empty() ? nullptr : dumpRefPath.c_str();
     nraw::g_cleanPath3 = (!opt.noSidecar && opt.dumpRef.empty())

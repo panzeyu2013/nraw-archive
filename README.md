@@ -91,7 +91,7 @@ ctest --test-dir build
 nraw-archive [options] input.NEV [output.mov]
 ```
 
-Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sidecar.json`.
+Default output: `input.h265.mov` next to the source, plus `sidecar_input.h265.json`.
 
 ### CLI options
 
@@ -108,6 +108,7 @@ Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sideca
 | `--min-keyint <n>` | minimum GOP | 1 |
 | `--pools <n>` | x265 encoding thread pool (encode only; independent of decode workers) | auto (split by --jobs) |
 | `--cpu-workers <n>` | CPU decode worker processes (each ~1 fps, N workers ≈ N fps) | auto (split by --jobs, capped at 8) |
+| `--worker-batch <n>` | worker generation-recycling batch (default 1000 frames/generation): the R3D SDK decode accumulates memory that cannot be reclaimed in-process, so each worker exits cleanly after N frames and the parent respawns the next generation — memory returns to the OS on process exit (peak is bounded) | 1000 |
 | `--jobs <n>` | total CPU thread budget, auto-split into decode workers and x265 pools (explicit --cpu-workers/--pools win) | auto (= online cores) |
 | `--open-gop <0\|1>` | GOP structure: 1 = open (scenecut I-frames), 0 = closed (all IDR, frame-accurate cuts) | 1 |
 | `--buffers <n>` | frame queue depth (GPU path only) | 16 |
@@ -130,7 +131,7 @@ Default output: `input.h265.mov` next to the source, plus `input.h265.mov.sideca
   - The encode records a sample log (`<out>.samples`, binary: sample size/timestamps/frame numbers) and a checkpoint (`<out>.ckpt`, refreshed every 500 frames). On the **next run, the tool auto-detects `.part` + checkpoint and resumes**: after verifying the source file and encode settings (crf/preset/GOP/color/lens/decode path etc.) via SHA-256 fingerprints, the already-encoded part is reused directly (no re-decode/re-encode) and encoding continues from the resume point — an interrupted 12-hour run finishes in minutes. The resume point is the **last complete keyframe**: closed-GOP resumes keyframe-aligned; open-GOP backs off a further **17 frames** (=2×(bframes+P-interval)−1) because scenecut keyframes may be written before their GOP-tail B-frames, so no frames are lost and no decode gaps appear; the point is then **finely adjusted under a "no timeline shift" constraint** (movenc 6.1 requires strictly increasing dts and pts≥dts: the replayed region's max dts must be below the re-encoded region's first-packet dts, otherwise a whole-timeline pts shift would jump the seam — or worse, replayed tail B-frames referencing re-encoded frames fail to decode, which the default open-GOP keyframe-anchored point hits in practice). If no keyframe-anchored candidate satisfies the constraint, the resume point walks forward frame-by-frame (it may land on a non-keyframe; a fresh IDR starts there) until it holds, so the seam's dts/pts stay exactly continuous; already-encoded audio is reused too, with the seam block-aligned.
   - Resume is repeatable: **a second resume after the resume session itself was interrupted works too** (the encoder flushes pending frames on interrupt; `.part`/`.samples`/`.ckpt` stay self-consistent). Closed-GOP resume points are keyframe-aligned (replayed GOP tails keep their references intact); open-GOP resumes back off 17 frames because scenecut keyframes may be written before their GOP-tail B-frames.
   - Signal interrupts (SIGINT/SIGTERM) also preserve the partials for resume.
-- `xxx.h265.mov.sidecar.json` — sha256 of the source (computed with a built-in SHA-256 implementation, no external `sha256sum` dependency), color space RWG/Log3G10, matrix BT.2020 full range, lens-correction state, decode path (`decode_path: gpu|cpu`, with `gpu_device` and the A/B gate minimum PSNR `gate_psnr_db`), encode parameters (crf/preset/keyint/etc.), and clip metadata.
+- `sidecar_xxx.h265.json` — sha256 of the source (computed with a built-in SHA-256 implementation, no external `sha256sum` dependency), color space RWG/Log3G10, matrix BT.2020 full range, lens-correction state, decode path (`decode_path: gpu|cpu`, with `gpu_device` and the A/B gate minimum PSNR `gate_psnr_db`), encode parameters (crf/preset/keyint/etc.), and clip metadata.
 
 **Exit codes:** 0 success; 1 bad arguments; 2 SDK/media open failure (including forced-GPU unavailable with `--decode gpu`); 4 processing failure (encode/write/GPU pipeline); 5 sidecar write failure. With `--gpu-test`: 0 = GPU path usable (init + gate passed), 2 = GPU initialization failed, 4 = A/B gate failed or could not run. With `--gpu-test` and **no input file** (init + kernel compile only): 0 = init passed, 2 = init failed. SIGINT/SIGTERM preserves the partial artifacts (`.part`/`.samples`/`.ckpt`) for automatic resume on the next run and exits 130.
 
@@ -169,7 +170,7 @@ Import `xxx.h265.mov`, then in Clip Attributes set Input Color Space to **RWG / 
 
 ## Batch archiving
 
-- Two artifacts per clip: `xxx.h265.mov` + `xxx.h265.mov.sidecar.json`, named after the NEV.
+- Two artifacts per clip: `xxx.h265.mov` + `sidecar_xxx.h265.json`, named after the NEV.
 - Keep the NEV as the master (16-bit source).
 - `batch.sh <dir> [extra args...]` — walks `*.NEV`/`*.nev` in the directory, logs failures to `<dir>/batch_failures.log` and continues; `--force` redoes existing outputs, `--dry-run` previews.
 - Scripts locate the binary in their own directory / parent / `../build`, or via the `NRAW_ARCHIVE` environment variable.

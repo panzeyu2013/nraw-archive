@@ -1,9 +1,18 @@
 #include "sha256.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>   // posix_fadvise（大文件顺序读防页缓存翻搅）
+#include <mutex>
+#include <thread>
 #include <vector>
+
+#if defined(NRAW_HAVE_OPENSSL)
+#include <openssl/sha.h>
+#endif
 
 namespace nraw {
 
@@ -143,20 +152,116 @@ std::string sha256File(const std::string& path)
     FILE* f = fopen(path.c_str(), "rb");
     if (!f)
         return "";
+    // RAII：后续 16MB 缓冲分配/reader 线程创建可能抛异常（OOM/EAGAIN），
+    // 异常路径也必须关闭 FILE*，避免每次失败泄漏一个文件描述符。
+    struct FCloseGuard {
+        FILE* f;
+        ~FCloseGuard() {
+            if (f)
+                fclose(f);
+        }
+    } guard{f};
+#if defined(__linux__)
+    // 顺序读提示：源文件数百 GB 顺序哈希只读一遍。POSIX_FADV_SEQUENTIAL
+    // 让内核按顺序预读并对已读页 drop-behind（不滞留页缓存，避免 487GB
+    // 文件翻搅页缓存挤压其他进程内存 → OOM 放大器）。注意 DONTNEED 是
+    // 一次性动作（fopen 后调用无页可丢），不能建立"每次读后丢弃"，故不用。
+    const int fd = fileno(f);
+    if (fd >= 0)
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    // 可达 1GB/s+；常驻 reader 线程预读下一块的同时主线程计算当前块，I/O
+    // 与 SHA-256 计算重叠（237GB 源文件哈希从串行的 ~20 分钟降到 I/O 上限）。
+    // 计算侧优先用 OpenSSL（x86-64 上自动启用 SHA-NI 硬件加速，纯软件
+    // SHA-256 单线程仅 ~350MB/s，SHA-NI 可达 1.5GB/s+），不可用时回退
+    // 到内置纯软件实现。
+    const size_t bufSize = 1u << 24;  // 16MB：减少块切换同步次数，NFS 大块读吞吐更稳
+    std::vector<uint8_t> bufs[2];
+    bufs[0].resize(bufSize);
+    bufs[1].resize(bufSize);
+
+#if defined(NRAW_HAVE_OPENSSL)
+    SHA256_CTX c;
+    SHA256_Init(&c);
+#else
     Ctx c;
     init(c);
-    std::vector<uint8_t> buf(1 << 16);
-    size_t n;
-    bool fail = false;
-    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0)
-        update(c, buf.data(), n);
-    if (ferror(f))
-        fail = true;
+#endif
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool full[2] = {false, false};   // 缓冲 i 是否有待计算数据
+    bool eof = false;
+    size_t nread[2] = {0, 0};
+    std::atomic<bool> fail(false);
+
+    // 常驻预读线程：填满缓冲 i 后通知主线程，转去填另一块（乒乓）。
+    // 关键不变量：只有主线程把缓冲标记为空闲（full[i]==false）后，
+    // reader 才允许重填该缓冲——确保计算期间缓冲不被改写。
+    std::thread reader([&]() {
+        int i = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] { return !full[i] || eof; });
+            if (eof)
+                break;
+            lk.unlock();
+            const size_t r = fread(bufs[i].data(), 1, bufSize, f);
+            // 短读+错误（0<r<bufSize 且 ferror 置位）也必须捕获——仅判
+            // r==0 会漏检，多付一次 NFS soft 超时（最长 ~20 分钟）
+            if (ferror(f))
+                fail.store(true);
+            lk.lock();
+            nread[i] = r;
+            full[i] = true;
+            if (r == 0)
+                eof = true;
+            lk.unlock();
+            cv.notify_all();
+            if (r == 0)
+                break;
+            i = 1 - i;
+        }
+    });
+
+    // 主线程：计算当前块，同时 reader 已在预读下一块
+    int i = 0;
+    for (;;) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return full[i] || eof; });
+        if (!full[i])
+            break;  // EOF 且无新数据
+        const size_t n = nread[i];
+        lk.unlock();
+        if (n == 0)
+            break;
+#if defined(NRAW_HAVE_OPENSSL)
+        SHA256_Update(&c, bufs[i].data(), n);
+#else
+        update(c, bufs[i].data(), n);
+#endif
+        // 计算完成后才释放缓冲，reader 方可重填
+        lk.lock();
+        full[i] = false;
+        cv.notify_all();
+        lk.unlock();
+        i = 1 - i;
+    }
+
+    reader.join();
+    // 先记录失败标志再关闭（fclose 可能改变 ferror 状态；关闭由 FCloseGuard
+    // RAII 兜底，显式 fclose 可提前释放 fd 且失败路径也不泄漏）
+    const bool bad = fail.load() || ferror(f);
     fclose(f);
-    if (fail)
+    guard.f = nullptr;
+    if (bad)
         return "";
     uint8_t out[32];
+#if defined(NRAW_HAVE_OPENSSL)
+    SHA256_Final(out, &c);
+#else
     finish(c, out);
+#endif
     return toHex(out, sizeof(out));
 }
 

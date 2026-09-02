@@ -89,7 +89,7 @@ ctest --test-dir build
 nraw-archive [options] input.NEV [output.mov]
 ```
 
-默认输出与源同目录同名的 `input.h265.mov`，并生成 `input.h265.mov.sidecar.json`。
+默认输出与源同目录同名的 `input.h265.mov`，并生成 `sidecar_input.h265.json`。
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
@@ -104,6 +104,7 @@ nraw-archive [options] input.NEV [output.mov]
 | `--min-keyint <n>` | 最小 GOP | 1 |
 | `--pools <n>` | x265 编码线程池大小（仅编码；与解码 worker 相互独立） | auto（由 --jobs 统一分配） |
 | `--cpu-workers <n>` | CPU 解码 worker 进程数（每个约 ~1fps，N 个≈N fps） | auto（由 --jobs 分配，上限 8） |
+| `--worker-batch <n>` | worker 代际回收批次（默认 1000 帧/代）：R3D SDK 解码存在进程内无法回收的内存积累，worker 每解码 N 帧后干净退出、由父进程重启下一批，内存随进程退出归还（峰值有界） | 1000 |
 | `--jobs <n>` | CPU 总线程预算，自动拆分为解码 worker 数与 x265 pools（显式 --cpu-workers/--pools 优先） | auto（= 可用核心数） |
 | `--open-gop <0\|1>` | GOP 结构：1=open（场景切点 I 帧），0=closed（全 IDR，帧精确剪接更稳） | 1 |
 | `--buffers <n>` | 帧队列深度（GPU 路径使用；CPU 路径由管道背压控制） | 16 |
@@ -126,7 +127,7 @@ nraw-archive [options] input.NEV [output.mov]
   - 编码过程记录样本日志（`<out>.samples`，二进制：样本大小/时间戳/帧号）与检查点（`<out>.ckpt`，每 500 帧刷新）；**下次运行自动检测到 `.part`+检查点即自动续传**：源文件与编码参数（crf/preset/GOP/色彩/镜头矫正/解码路径等）经 SHA-256 校验一致后，已编码部分直接复用（不重新解码/编码），从续传点继续编码剩余帧——12 小时的编码中断后重跑只需几分钟收尾。续传点取**最后完整关键帧**：closed-GOP 直接关键帧对齐；open-GOP 因 scenecut 关键帧可能先于其 GOP 尾部 B 帧写入，续传点再**回退 17 帧**（=2×(bframes+P 间隔)-1）保证尾部 B 帧引用封闭，不产生解码缺口；随后按"无时间轴平移"约束**动态微调**（movenc 6.1 要求 dts 严格递增且 pts≥dts：重放区最大 dts 必须小于重编码首包 dts，否则整体平移 pts 会造成接缝跳变、甚至重放尾部引用重编码区导致解码失败——实测 open-GOP 默认配置下关键帧锚定续传点即触发该问题）。不满足时续传点逐帧前移（可落在非关键帧，新 IDR 从该帧起）直到约束满足，保证接缝处 dts/pts 严格连续；音频已编码部分同样复用，衔接点与块边界对齐。
   - 续传可反复进行：**续传会话自身再次中断后仍可再次续传**（编码器在中断时冲刷挂起帧，`.part`/`.samples`/`.ckpt` 始终自洽）。closed-GOP 续传点对齐关键帧（重放 GOP 尾部引用完整）；open-GOP 因 scenecut 关键帧可能先于尾部 B 帧写入，续传点回退 17 帧避免丢帧。
   - 信号中断（SIGINT/SIGTERM）同样保留部分产物供续传。
-- `xxx.h265.mov.sidecar.json`：sha256（源文件，内置 SHA-256 实现计算，不依赖外部 sha256sum）、色彩空间 RWG/Log3G10、matrix BT.2020 full range、镜头矫正状态、解码路径（`decode_path: gpu|cpu`，含 `gpu_device` 与 A/B 门控最低 PSNR `gate_psnr_db`）、编码参数（crf/preset/keyint 等）、clip 元数据。
+- `sidecar_xxx.h265.json`：sha256（源文件，内置 SHA-256 实现计算，不依赖外部 sha256sum）、色彩空间 RWG/Log3G10、matrix BT.2020 full range、镜头矫正状态、解码路径（`decode_path: gpu|cpu`，含 `gpu_device` 与 A/B 门控最低 PSNR `gate_psnr_db`）、编码参数（crf/preset/keyint 等）、clip 元数据。
 
 退出码：0 成功；1 参数错误；2 SDK/媒体打开失败（含 `--decode gpu` 强制模式下的 GPU 不可用）；4 处理失败（编码/写入/GPU 管线中断）；5 sidecar 写入失败。`--gpu-test` 模式下：0 = GPU 可用（初始化+门控通过），2 = GPU 初始化失败，4 = A/B 门控未达标或未能执行；`--gpu-test` 无输入文件时（仅初始化+内核编译）：0 = 初始化通过，2 = 初始化失败。SIGINT/SIGTERM 时保留部分产物（`.part`/`.samples`/`.ckpt`）供下次运行自动续传，以 130 退出。
 
@@ -165,7 +166,7 @@ SDK 输出 24bit 大端音频 → s24le 小端位精确重排（`repack24beToS24
 
 ## 归档规范
 
-- 每个 clip 两份产物：`xxx.h265.mov` + `xxx.h265.mov.sidecar.json`，与 NEV 同名。
+- 每个 clip 两份产物：`xxx.h265.mov` + `sidecar_xxx.h265.json`，与 NEV 同名。
 - NEV 双轨保留为母版（16bit 源）。
 - 批量归档：`batch.sh <目录> [额外参数...]` — 遍历目录下 *.NEV / *.nev，失败记录到 `<目录>/batch_failures.log` 并继续，`--force` 强制重做、`--dry-run` 预演。
 - 脚本定位可执行文件：自身同目录 / 上一级 / `../build`，或通过环境变量 `NRAW_ARCHIVE=/路径/nraw-archive` 指定。
