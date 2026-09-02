@@ -865,7 +865,7 @@ std::string x265Params(const CliOptions& opt)
     s += ":range=full";
     // 显式声明 GOP 结构，避免依赖 x265 默认值变化（README 默认 open GOP）
     s += opt.openGop == 0 ? ":open-gop=0" : ":open-gop=1";
-    int pools = opt.pools > 0 ? opt.pools : 8;
+    int pools = opt.pools > 0 ? opt.pools : 12;  // 默认 12 编码器（与 --jobs 默认分配一致）
     s += ":pools=" + std::to_string(pools);
     return s;
 }

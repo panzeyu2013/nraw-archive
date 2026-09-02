@@ -2,7 +2,7 @@
 
 **Nikon N-RAW (.NEV) → single-file HEVC archive tool** for Nikon Z8/Z9 footage.
 
-Two decode paths: a **GPU path** (AsyncDecoder multi-threaded decompression + REDOpenCL GPU debayer/IPP2, with automatic fallback when no GPU or OpenCL driver is present) and a **CPU path** (synchronous SDK decode parallelized across N worker processes: the classic SDK decode is globally serialized within a process (~1 fps), so `--decode cpu` forks N workers decoding frames k mod N over pipes, measured ~5× faster). Zero intermediate files — SDK decode feeds x265 encoding directly into a single MOV, with a sidecar JSON recording checksums, metadata, and the decode path (`decode_path: gpu/cpu`).
+Two decode paths: a **GPU path** (AsyncDecoder multi-threaded decompression + REDOpenCL GPU debayer/IPP2, with automatic fallback when no GPU or OpenCL driver is present) and a **CPU path** (synchronous SDK decode parallelized across N worker processes: the classic SDK decode is globally serialized within a process (~1 fps), so `--decode cpu` spawns N decoder processes (frames k mod N) feeding frames through a shared-memory frame buffer (memfd), measured ~5× faster). Zero intermediate files — SDK decode feeds x265 encoding directly into a single MOV, with a sidecar JSON recording checksums, metadata, and the decode path (`decode_path: gpu/cpu`).
 
 > 中文版 → [README.zh-CN.md](README.zh-CN.md)
 
@@ -106,10 +106,10 @@ Default output: `input.h265.mov` next to the source, plus `sidecar_input.h265.js
 | `--preset <p>` | x265 speed preset | slow |
 | `--keyint <n>` | GOP length | auto (2 s × frame rate) |
 | `--min-keyint <n>` | minimum GOP | 1 |
-| `--pools <n>` | x265 encoding thread pool (encode only; independent of decode workers) | auto (split by --jobs) |
-| `--cpu-workers <n>` | CPU decode worker processes (each ~1 fps, N workers ≈ N fps) | auto (split by --jobs, capped at 8) |
+| `--decoders <n>` | decoder processes (the R3D SDK decode is serialized within a process, so parallelism comes from multiple processes; each ≈ 1 fps) | default 3 (reallocatable via --jobs) |
+| `--encoders <n>` | encoder threads (x265 WPP thread pool; measured: zero gain beyond 12 threads on the slow preset) | default 12 (reallocatable via --jobs) |
 | `--worker-batch <n>` | worker generation-recycling batch (default 1000 frames/generation): the R3D SDK decode accumulates memory that cannot be reclaimed in-process, so each worker exits cleanly after N frames and the parent respawns the next generation — memory returns to the OS on process exit (peak is bounded) | 1000 |
-| `--jobs <n>` | total CPU thread budget, auto-split into decode workers and x265 pools (explicit --cpu-workers/--pools win) | auto (= online cores) |
+| `--jobs <n>` | total CPU thread budget: default (unset) = 3 decoders + 12 encoders (measured optimum); budgets above 18 cores are allowed to over-allocate (2/3 of the surplus to encoders, 1/3 to decoders), smaller budgets shrink proportionally; explicit --decoders/--encoders win (explicit values may exceed the --jobs budget) | default 3+12 |
 | `--open-gop <0\|1>` | GOP structure: 1 = open (scenecut I-frames), 0 = closed (all IDR, frame-accurate cuts) | 1 |
 | `--buffers <n>` | frame queue depth (GPU path only) | 16 |
 | `--frames <n>` | process at most N frames (testing) | all |

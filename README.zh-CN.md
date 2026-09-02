@@ -1,6 +1,6 @@
 # nraw-archive — Nikon NRAW (.NEV) → HEVC 存档工具
 
-Nikon Z8/Z9 等 N-RAW（.NEV）→ 单文件 HEVC 归档工具。双解码路径：**GPU 主路径**（AsyncDecoder 多线程解压 + REDOpenCL GPU debayer/IPP2，无 GPU 或无 OpenCL 驱动时自动回退）与 **CPU 并行路径**（SDK 同步解码 + 多进程并行：实测 SDK 经典解码为进程内全局串行 ~1fps，故 --decode cpu 派生 N 个 worker 子进程经管道并行解码，实测约 5× 提速）。零中间文件，SDK 解码与 x265 编码直接对接输出单个 MOV，附带 sidecar JSON 记录校验、元数据与解码路径（`decode_path: gpu/cpu`）。
+Nikon Z8/Z9 等 N-RAW（.NEV）→ 单文件 HEVC 归档工具。双解码路径：**GPU 主路径**（AsyncDecoder 多线程解压 + REDOpenCL GPU debayer/IPP2，无 GPU 或无 OpenCL 驱动时自动回退）与 **CPU 并行路径**（SDK 同步解码 + 多进程并行：实测 SDK 经典解码为进程内全局串行 ~1fps，故 --decode cpu 派生 N 个解码器子进程经共享帧缓冲（memfd）并行解码，实测约 5× 提速）。零中间文件，SDK 解码与 x265 编码直接对接输出单个 MOV，附带 sidecar JSON 记录校验、元数据与解码路径（`decode_path: gpu/cpu`）。
 
 > English → [README.md](README.md)
 
@@ -102,10 +102,10 @@ nraw-archive [options] input.NEV [output.mov]
 | `--preset <p>` | x265 速度档 | slow |
 | `--keyint <n>` | GOP 长度 | auto（2 秒 × 帧率） |
 | `--min-keyint <n>` | 最小 GOP | 1 |
-| `--pools <n>` | x265 编码线程池大小（仅编码；与解码 worker 相互独立） | auto（由 --jobs 统一分配） |
-| `--cpu-workers <n>` | CPU 解码 worker 进程数（每个约 ~1fps，N 个≈N fps） | auto（由 --jobs 分配，上限 8） |
+| `--decoders <n>` | 解码器进程数（R3D SDK 单进程内串行，靠多进程并行；每个 ~1fps） | 默认 3（--jobs 可重分配） |
+| `--encoders <n>` | 编码器线程数（x265 WPP 线程池；实测 slow 档 12 线程后零增益） | 默认 12（--jobs 可重分配） |
 | `--worker-batch <n>` | worker 代际回收批次（默认 1000 帧/代）：R3D SDK 解码存在进程内无法回收的内存积累，worker 每解码 N 帧后干净退出、由父进程重启下一批，内存随进程退出归还（峰值有界） | 1000 |
-| `--jobs <n>` | CPU 总线程预算，自动拆分为解码 worker 数与 x265 pools（显式 --cpu-workers/--pools 优先） | auto（= 可用核心数） |
+| `--jobs <n>` | CPU 总线程预算：默认（未指定）= 3 解码器 + 12 编码器（实测最优）；预算超过 18 核时允许超配（多余预算 2/3 给编码器、1/3 给解码器），不足时按比例收缩；显式 --decoders/--encoders 优先（显式值可能使实际占用超出 --jobs） | 默认 3+12 |
 | `--open-gop <0\|1>` | GOP 结构：1=open（场景切点 I 帧），0=closed（全 IDR，帧精确剪接更稳） | 1 |
 | `--buffers <n>` | 帧队列深度（GPU 路径使用；CPU 路径由管道背压控制） | 16 |
 | `--frames <n>` | 处理帧数上限（测试用） | 全部 |

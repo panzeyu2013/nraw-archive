@@ -40,3 +40,7 @@ Testing/
 
 # macOS
 .DS_Store
+
+# 性能测量/IO 归因实验脚本（含绝对路径，不入库）
+scripts/perf_campaign*.sh
+scripts/io_probe*.sh

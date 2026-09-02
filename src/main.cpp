@@ -67,6 +67,10 @@ void installSignalHandlers()
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    // 父进程向 worker 确认管道写槽位释放确认（ack），worker 退出后
+    // 该写会触发 EPIPE——默认 SIGPIPE 会终止父进程，必须忽略。
+    // （worker 子进程在 runDecodeWorker 中显式恢复 SIGPIPE 默认行为。）
+    signal(SIGPIPE, SIG_IGN);
 }
 
 bool parseLong(const char* s, long& v)
@@ -212,10 +216,10 @@ void printHelp()
     printf("  --preset <name>         x265 预设 (默认 slow)\n");
     printf("  --keyint <N>            关键帧间隔 (默认 0=round(fps*2))\n");
     printf("  --min-keyint <N>        最小关键帧间隔 (默认 1)\n");
-    printf("  --pools <N>             x265 编码线程池大小 (默认 0=auto，由 --jobs 统一分配)\n");
-    printf("  --cpu-workers <N>       CPU 解码 worker 进程数 (默认 0=auto，每个约 ~1fps，8 个≈8fps)\n");
+    printf("  --decoders <N>          解码器进程数（R3D SDK 单进程内串行，靠多进程并行；默认 3，--jobs 可重分配）\n");
+    printf("  --encoders <N>          编码器线程数（x265 WPP 线程池；默认 12，--jobs 可重分配）\n");
     printf("  --worker-batch <N>     worker 代际回收批次大小 (默认 1000 帧/代；R3D SDK 解码存在无法在进程内回收的内存积累，worker 每解码 N 帧后干净退出并由父进程重启下一批，内存随进程退出归还)\n");
-    printf("  --jobs <N>              CPU 总线程预算 (默认 0=auto=核心数)；自动拆分 worker 数与 x265 pools\n");
+    printf("  --jobs <N>              CPU 总线程预算（默认 = 3 解码器 + 12 编码器，实测最优；预算更大时允许超配，不足时按比例收缩）\n");
     printf("  --open-gop <0|1>        GOP 结构: 1=open(场景切点,默认), 0=closed\n");
     printf("  --buffers <N>           帧队列深度 (默认 16)\n");
     printf("  --frames <N>            仅处理前 N 帧 (默认 -1=全部)\n");
@@ -247,8 +251,8 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         {"preset",          required_argument, nullptr, 'p'},
         {"keyint",          required_argument, nullptr, 'k'},
         {"min-keyint",      required_argument, nullptr, 'm'},
-        {"pools",           required_argument, nullptr, 'o'},
-        {"cpu-workers",     required_argument, nullptr, 'J'},
+        {"encoders",        required_argument, nullptr, 'o'},
+        {"decoders",        required_argument, nullptr, 'J'},
         {"jobs",            required_argument, nullptr, 'j'},
         {"buffers",         required_argument, nullptr, 'b'},
         {"frames",          required_argument, nullptr, 'f'},
@@ -379,7 +383,7 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         case 'o': {
             long v;
             if (!parseLong(optarg, v) || v < 0 || v > 1024) {
-                fprintf(stderr, "无效的 --pools 值: %s\n", optarg);
+                fprintf(stderr, "无效的 --encoders 值: %s\n", optarg);
                 return 1;
             }
             opt.pools = static_cast<int>(v);
@@ -388,7 +392,7 @@ int parseArgs(int argc, char** argv, CliOptions& opt, bool& wantHelp, bool& want
         case 'J': {
             long v;
             if (!parseLong(optarg, v) || v < 1 || v > 256) {
-                fprintf(stderr, "无效的 --cpu-workers 值: %s\n", optarg);
+                fprintf(stderr, "无效的 --decoders 值: %s\n", optarg);
                 return 1;
             }
             opt.cpuWorkers = static_cast<int>(v);
@@ -629,7 +633,7 @@ int writeSidecar(const std::string& outPath, const CliOptions& opt,
     fprintf(fp, "  \"encode\": {\"codec\": \"hevc main10\", \"crf\": %d, \"preset\": \"%s\", "
                 "\"keyint\": %d, \"min_keyint\": %d, \"pools\": %d},\n",
             opt.crf, jsonEsc(opt.preset).c_str(), sidecarKeyint(opt, info),
-            opt.minKeyint > 0 ? opt.minKeyint : 1, opt.pools > 0 ? opt.pools : 8);
+            opt.minKeyint > 0 ? opt.minKeyint : 1, opt.pools > 0 ? opt.pools : 12);
     fprintf(fp, "  \"success\": %s,\n", ok ? "true" : "false");
     fprintf(fp, "  \"meta\": [");
     for (size_t i = 0; i < info.meta.size(); ++i) {
@@ -1490,24 +1494,66 @@ int main(int argc, char** argv)
     if (useGpu) {
         rc = nraw::runGpuPath(opt, info, frameCount, gpuPipe);
     } else {
-        // 统一 CPU 调度：总预算 = --jobs（默认 = 可用核心数），拆分为
-        //   解码 worker 进程数（每个 ~2 核：1 核解码 + SDK 内部线程开销）与
-        //   x265 编码线程池（剩余预算）。显式指定的 --cpu-workers / --pools 优先。
-        if (opt.jobs <= 0) {
-            long n = sysconf(_SC_NPROCESSORS_ONLN);
-            opt.jobs = n > 0 ? static_cast<int>(n) : 8;
+        // 统一 CPU 调度：全局总线程预算 = --jobs；默认（未指定）恒为
+        // 3 解码器 + 12 编码器（实测最优，用户明确要求）。
+        // 内部自动拆分为解码器进程数（decoders）与编码器线程数（encoders）。
+        // 默认（未指定 --jobs）= 3 解码器 + 12 编码器：实测最优（本机
+        // slow/CRF14：编码器 12 线程后零增益、解码器 3 个即满足供给）。
+        // 指定 --jobs N 时按预算分配：N 超过最优所需（18 核）时允许超配
+        // （多余预算 2/3 给编码器、1/3 给解码器，按 2 核/解码器折算）；
+        // N 不足时按比例收缩（编码器优先保底）。显式 --decoders /
+        // --encoders 优先，两者都显式时完全尊重、不做任何覆盖。
+        const int decOpt = 3;
+        const int encOpt = 12;
+        const int optCores = decOpt * 2 + encOpt;
+        if (opt.cpuWorkers <= 0 && opt.pools <= 0) {
+            if (opt.jobs <= 0) {
+                // 默认恒为 3 解码器 + 12 编码器（实测最优；用户明确要求）。
+                // 低核机器请显式传 --jobs 收缩。
+                opt.cpuWorkers = decOpt;
+                opt.pools = encOpt;
+            } else {
+                const long N = opt.jobs;
+                if (N >= optCores) {
+                    const long extra = N - optCores;
+                    const long encAdd = extra * 2 / 3;
+                    const long decAdd = (extra - encAdd) / 2;
+                    opt.pools = encOpt + static_cast<int>(encAdd);
+                    opt.cpuWorkers = decOpt + static_cast<int>(decAdd);
+                } else {
+                    // 预算不足：编码器优先（先扣解码器的 2 核/个），
+                    // 解码器取剩余；下限各 1（jobs=1,2 时实际约 3 核）
+                    const long p = N - 2L * decOpt;
+                    opt.pools = static_cast<int>(p < 1 ? 1 : p);
+                    const long w = (N - opt.pools) / 2;
+                    opt.cpuWorkers = static_cast<int>(w < 1 ? 1
+                                : (w > decOpt ? decOpt : w));
+                }
+                // 钳制到显式上限（--decoders≤256、--encoders≤1024），
+                // 防超大 --jobs 分配出超出信号槽容量的解码器进程数
+                if (opt.pools > 1024)
+                    opt.pools = 1024;
+                if (opt.cpuWorkers > 256)
+                    opt.cpuWorkers = 256;
+            }
+        } else if (opt.pools <= 0) {
+            // 只显式给了解码器：编码器 = 预算剩余（--jobs 未指定时用默认 12）
+            long p = opt.jobs > 0
+                         ? static_cast<long>(opt.jobs) - 2L * opt.cpuWorkers
+                         : encOpt;
+            opt.pools = static_cast<int>(p < 1 ? 1 : p);
+        } else if (opt.cpuWorkers <= 0) {
+            // 只显式给了编码器：解码器 = 预算剩余（--jobs 未指定时用默认 3）
+            long w = opt.jobs > 0
+                         ? (static_cast<long>(opt.jobs) - opt.pools) / 2
+                         : decOpt;
+            opt.cpuWorkers = static_cast<int>(w < 1 ? 1 : w);
         }
-        if (opt.cpuWorkers <= 0) {
-            long w = opt.jobs / 4;   // 每 worker 按 ~4 核预算 1 个（保守）
-            opt.cpuWorkers = w < 1 ? 1 : (w > 8 ? 8 : static_cast<int>(w));
-        }
-        if (opt.pools <= 0) {
-            long p = static_cast<long>(opt.jobs) - 2L * opt.cpuWorkers;
-            opt.pools = p < 1 ? 1 : (p > 1024 ? 1024 : static_cast<int>(p));
-        }
-        printf("CPU 调度: %d 个解码 worker 进程 + x265 pools=%d（总预算 %d 核；"
-               "--cpu-workers/--pools 可显式覆盖）\n",
-               opt.cpuWorkers, opt.pools, opt.jobs);
+        printf("CPU 调度: %d 个解码器进程 + %d 个编码器线程（总预算 %s；"
+               "--decoders/--encoders 可显式覆盖）\n",
+               opt.cpuWorkers, opt.pools,
+               opt.jobs > 0 ? std::to_string(opt.jobs).c_str()
+                            : "默认 3+12");
         rc = nraw::runCpuPath(opt, info, frameCount);
     }
     gpuPipe.close();

@@ -304,9 +304,9 @@ struct CliOptions {
     int   keyint = 0;                // 0 = auto (round(fps*2))
     int   minKeyint = 1;
     int   openGop = 1;               // 1 = open GOP (scenecut), 0 = closed GOP
-    int   pools = 0;                 // x265 编码线程池 (0 = auto，由 --jobs 统一分配)
-    int   cpuWorkers = 0;            // CPU 解码 worker 进程数 (0 = auto，由 --jobs 分配)
-    int   jobs = 0;                  // CPU 总线程预算 (0 = auto = 核心数)；拆分 worker 数与 x265 pools
+    int   pools = 0;                 // 编码器线程数（x265 WPP 线程池；0 = auto，由 --jobs 统一分配）
+    int   cpuWorkers = 0;            // 解码器进程数（R3D SDK 单进程内串行，多进程并行；0 = auto，由 --jobs 分配）
+    int   jobs = -1;                 // CPU 总线程预算（负值 = 默认分配 3 解码器 + 12 编码器，实测最优）；拆分解码器数与编码器线程数
     int   buffers = 16;
     bool  gpuTest = false;           // --gpu-test: GPU 初始化+内核编译+A/B 门控测试后退出
 };
@@ -485,8 +485,6 @@ std::string sdkVersion();
 bool   openMedia(const std::string& path, const CliOptions& opt, MediaInfo& info, std::string& err);
 bool   appliedSettings(AppliedSettings& out);
 void   closeMedia();
-// 只释放全局 gClip（元数据已读入 gInfo），保留 gIp——worker 消除冗余双 Clip
-void   releaseGlobalClip();
 void*  sharedIpSettings();          // shared IPP2 ImageProcessingSettings* (stable during run)
 
 class SequentialDecoder {
@@ -524,9 +522,9 @@ private:
 // 多线程 CPU 解码器（多进程实现）：SDK 经典同步解码（Clip::DecodeVideoFrame）实测
 // ~1fps 且为进程内全局串行（并行 Clip/线程无效，4 进程并发实测 ~3.6fps 近线性扩展），
 // 因此 --decode cpu 通过 fork 出 N 个 worker 子进程（各自 ~1fps，帧号 ≡ k (mod N)），
-// 经管道流式回传 RGB 帧，父进程按帧号排序后交给 x265 编码；解码与编码流水线重叠。
+// 经共享帧缓冲（memfd 双槽）回传 Interleaved RGB 帧，父进程按帧号排序后交给 x265 编码；解码与编码流水线重叠。
 // 仅用于显式 --decode cpu（纯 CPU，不依赖 GPU/OpenCL）。音频在父进程内解码。
-// 用法: waitFrame() 按帧号递增取回解码帧（子进程自主解码，父进程背压由管道提供）。
+// 用法: waitFrame() 按帧号递增取回解码帧（子进程自主解码，父进程背压由 ready_ 队列与槽确认提供）。
 class CpuAsyncDecoder {
 public:
     CpuAsyncDecoder() = default;
@@ -554,7 +552,8 @@ private:
 };
 
 // 解码 worker 子进程入口（--decode-worker）：经典同步解码 帧号 ≡ id (mod count)，
-// 帧数据 [u64 frameNo][u32 size][payload] 写入 fd 3；返回 0=成功。
+// 帧数据写入共享帧缓冲（memfd fd 4，双槽），填充记录 [u64 frameNo][u32 slotIdx]
+// 写入 fd 3；槽释放确认从 fd 5 读取；返回 0=成功。
 int runDecodeWorker(const CliOptions& opt);
 
 // gpu_process.cpp

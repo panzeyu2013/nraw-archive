@@ -8,6 +8,9 @@
 #include <poll.h>
 #include <spawn.h>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -30,11 +33,25 @@ std::string gClipPath;
 MediaInfo gInfo;
 bool gOpen = false;
 
+// ---- 共享帧缓冲协议（方案 B：memfd + 双槽 + 控制/确认管道） ----
+// worker→父进程（fd 3）：填充记录 [u64 frameNo][u32 slotIdx]（12 字节）
+// 父进程→worker（fd 5）：槽释放确认 [u32 slotIdx]（4 字节）
+// worker 共享帧缓冲（fd 4）：memfd，MAP_SHARED，kShmSlots 个槽，
+// 每槽 slotSize = w*h*6 + kFrameGuard 字节；SDK 直接解码进槽，
+// 免去管道双向 115MB/帧 的拷贝。双槽让"解码下一帧"与"父进程消费当前帧"
+// 完全重叠；槽复用前 worker 必须收到对应槽的确认（pendingAck）。
+constexpr int kWorkerOutFd = 3;
+constexpr int kShmFd = 4;
+constexpr int kAckFd = 5;
+constexpr size_t kShmSlots = 2;
+constexpr size_t kFrameGuard = 65536;  // SDK 行填充余量（哨兵校验用）
+
+
 }  // namespace
 
 // 信号处理用的 worker PID 槽（main.cpp 的 onSignal 引用）：主线程在
 // spawn/close 时写入，信号处理器只读。固定数组 + sig_atomic_t 计数，
-// 无锁、无分配。容量与 --cpu-workers 上限（256）一致。
+// 无锁、无分配。容量与 --decoders 上限（256）一致。
 // 写序约定（保证 async-signal-safe 语义）：先写槽位再自增计数——
 // 处理器读到计数 n 时，槽 0..n-1 必已写全；仅存在"漏杀最新 worker"
 // 的无害竞态（该 worker 会经 EPIPE/SIGPIPE 自退）。严禁先自增后写
@@ -290,17 +307,6 @@ void closeMedia()
         gIp = nullptr;
     }
     gOpen = false;
-}
-
-// 只释放全局 gClip（元数据已读入 gInfo，解码用 dec 自己的 clip_），保留
-// gIp（decodeFrame 依赖）。worker 在 dec.open 后调用，消除冗余双 Clip
-// 持有的文件句柄/mmap（基线 RSS 可降 ~2GB）。
-void releaseGlobalClip()
-{
-    if (gClip) {
-        delete gClip;
-        gClip = nullptr;
-    }
 }
 
 bool SequentialDecoder::open(const CliOptions& opt, const MediaInfo& info, std::string& err)
@@ -631,16 +637,21 @@ void SequentialDecoder::close()
 // 实测经典同步 API（Clip::DecodeVideoFrame，DECODE_FULL_RES_PREMIUM）在 4K 下仅
 // ~1fps，且是 SDK 进程内全局串行：单进程内并行 Clip/线程无效，但跨进程近线性扩展
 // （实测 2 进程 2.0fps、4 进程 3.6fps）。因此 --decode cpu 由父进程 spawn 出 N 个
-// worker 子进程（各自用经典 API 解码 帧号 ≡ k (mod N)，每个 ~1fps），通过管道把
-// 解码帧 [u64 frameNo][u32 size][payload RGB planar 16-bit] 流式回传；父进程按帧号
-// 排序后交给 x265 编码，解码与编码流水线重叠。纯 CPU，不依赖 GPU/OpenCL。
+// worker 子进程（各自用经典 API 解码 帧号 ≡ k (mod N)，每个 ~1fps）。
+//
+// 帧传输走共享帧缓冲协议（memfd + 双槽）：SDK 直接解码进共享内存槽
+// （Interleaved），worker 只写 12 字节填充记录，父进程从共享内存重排为
+// Planar（57.5MB 读+写）后确认槽释放。相比管道直传省去 115MB/帧 的双向
+// 内核拷贝，且"解码下一帧"与"父进程消费当前帧"完全重叠。纯 CPU，不依赖
+// GPU/OpenCL。
 //
 // SDK 解码路径存在进程内无法回收的内存积累（Planar 像素路径 ~1MB/帧，且随机
 // 跨区解码进一步积累；delete Clip / FinalizeSdk / malloc_trim 均无法回收——
-// 实测）。为此：1) decodeFrame 用 Interleaved 解码 + 应用内重排（输出与 Planar
-// 逐位一致），消除 Planar 路径泄漏；2) 代际回收（--worker-batch）：每个 worker
-// 进程每代只解码一批帧后干净退出，父进程检测干净 EOF 后 spawn 新一代继续，
-// 进程退出即归还全部内存——峰值内存有界，与 SDK 内部状态无关。
+// 实测）。为此：1) 统一使用 Interleaved 解码（输出与 Planar 逐位一致），消除
+// Planar 路径泄漏；2) 代际回收（--worker-batch）：每个 worker 进程每代只解码
+// 一批帧后干净退出，父进程检测干净 EOF 后 spawn 新一代继续（共享帧缓冲
+// 代际复用，不重建），进程退出即归还全部内存——峰值内存有界，与 SDK
+// 内部状态无关。
 // 子进程用 posix_spawn（不复制父进程内存，避免继承 SDK 内部线程锁）。
 // ---------------------------------------------------------------------------
 
@@ -684,7 +695,11 @@ private:
     bool respawnWorker(size_t idx, size_t nextStart, std::string& err);
 
     struct Worker {
-        int fd = -1;          // 管道读端（父进程）
+        int fd = -1;          // 控制管道读端（父进程，接收填充记录）
+        int ackFd = -1;       // 确认管道写端（父进程，发送槽释放确认）
+        int shmFd = -1;       // 共享帧缓冲 memfd（父进程持有，代际复用）
+        void* shmMap = nullptr;  // 共享帧缓冲映射（父进程，重排时读取）
+        size_t slotSize = 0;  // 单槽字节数（w*h*6 + guard）
         pid_t pid = -1;
         bool dead = false;
         std::string exitDetail;  // worker 退出信号/码（markDead 记录）
@@ -808,16 +823,18 @@ std::vector<std::string> workerArgs(const CliOptions& opt, size_t id,
     return a;
 }
 
-// 创建管道并 posix_spawn worker（open 与 respawnWorker 共用）。
+// 创建控制/确认管道并 posix_spawn worker（open 与 respawnWorker 共用）。
+// 子进程 fd 布局：3=填充记录管道写端，4=共享帧缓冲 memfd，5=确认管道读端。
 // 关键约束：
-//  - 管道两端 FD_CLOEXEC（防 worker 继承其他 worker 的管道读端）
-//  - 两端都不能占用 fd 3：file_actions 顺序为 dup2(fds[1]→3)、
-//    close(fds[1])、close(fds[0])，若 fds[0]==3 会在子进程内把刚 dup2 的
+//  - 所有继承 fd 均 FD_CLOEXEC（防 worker 间互相继承）
+//  - 任何一端都不能占用 fd 3：file_actions 顺序为 dup2(pipeW→3)、
+//    close(pipeW)、close(pipeR)，若 pipeR==3 会在子进程内把刚 dup2 的
 //    写端关掉 → worker 输出 fd 失效（F_DUPFD_CLOEXEC 搬迁到高位）
 //  - selfExePath() 为空时明确报错（不交给 posix_spawn 返回含糊的 ENOENT）
 static bool spawnWorkerProc(const CliOptions& opt, size_t id, size_t count,
-                            size_t total, size_t workerStart, int& readFd,
-                            pid_t& pid, std::string& err)
+                            size_t total, size_t workerStart, int shmFd,
+                            int ackReadFd, int& readFd, pid_t& pid,
+                            std::string& err)
 {
     int fds[2];
     if (pipe(fds) != 0) {
@@ -839,17 +856,8 @@ static bool spawnWorkerProc(const CliOptions& opt, size_t id, size_t count,
     }
     fcntl(fds[0], F_SETFD, FD_CLOEXEC);
     fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-#if defined(__linux__)
-    // 增大管道缓冲到上限（1MB）：每帧 98MB 经默认 64KB 管道需 1500 次
-    // write/read 系统调用 + 内核拷贝；1MB 缓冲降到 ~96 次，显著减少
-    // worker 写阻塞（wchan=anon_pipe_write 等待）与 syscall 开销。
-    // 实测纯解码 0.3-0.5fps/worker，管线中因管道阻塞降到 0.16fps——
-    // 管道缓冲是 worker 有效解码速率的主要拖累。
-    int ps = fcntl(fds[0], F_SETPIPE_SZ, 1024 * 1024);
-    if (ps < 0)
-        ps = fcntl(fds[0], F_GETPIPE_SZ, 0);  // 内核限制更低则用实际值
-    (void)ps;  // 失败不致命（64KB 仍可用）
-#endif
+    fcntl(shmFd, F_SETFD, FD_CLOEXEC);
+    fcntl(ackReadFd, F_SETFD, FD_CLOEXEC);
     std::vector<std::string> args = workerArgs(opt, id, count, total, workerStart);
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
@@ -859,7 +867,9 @@ static bool spawnWorkerProc(const CliOptions& opt, size_t id, size_t count,
 
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], 3);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], kWorkerOutFd);
+    posix_spawn_file_actions_adddup2(&fa, shmFd, kShmFd);
+    posix_spawn_file_actions_adddup2(&fa, ackReadFd, kAckFd);
     posix_spawn_file_actions_addclose(&fa, fds[1]);
     posix_spawn_file_actions_addclose(&fa, fds[0]);
     const std::string selfExe = nraw::selfExePath();
@@ -883,6 +893,57 @@ static bool spawnWorkerProc(const CliOptions& opt, size_t id, size_t count,
     return true;
 }
 
+// 创建共享帧缓冲（双槽映射）。Linux 用免特权 memfd_create（容器内可用）；
+// 其他平台回退 POSIX shm_open（立即 unlink 解链，映射仍有效）。失败明确报错。
+static bool createShmSlots(size_t frameSize, int& shmFd, void*& shmMap,
+                           std::string& err)
+{
+    shmFd = -1;
+    shmMap = nullptr;
+#if defined(__linux__)
+#ifdef MFD_CLOEXEC
+    shmFd = memfd_create("nraw_frame_shm", MFD_CLOEXEC);
+#else
+    shmFd = static_cast<int>(syscall(SYS_memfd_create, "nraw_frame_shm", 0));
+#endif
+    if (shmFd < 0) {
+        err = "memfd_create 失败: " + std::string(strerror(errno));
+        return false;
+    }
+#else
+    // POSIX 共享内存回退（macOS 等无 memfd 的平台）
+    static int shmCounter = 0;
+    char name[64];
+    snprintf(name, sizeof(name), "/nraw_shm_%d_%d",
+             static_cast<int>(getpid()), shmCounter++);
+    shmFd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (shmFd < 0) {
+        err = "shm_open 失败: " + std::string(strerror(errno));
+        return false;
+    }
+    shm_unlink(name);  // 立即解链：fd 与映射不受影响，退出自动清理
+#endif
+    fcntl(shmFd, F_SETFD, FD_CLOEXEC);
+    const size_t slotSize = frameSize + kFrameGuard;
+    const size_t total = slotSize * kShmSlots;
+    if (ftruncate(shmFd, static_cast<off_t>(total)) != 0) {
+        err = "ftruncate 共享帧缓冲失败: " + std::string(strerror(errno));
+        ::close(shmFd);
+        shmFd = -1;
+        return false;
+    }
+    void* m = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd,
+                   0);
+    if (m == MAP_FAILED) {
+        err = "mmap 共享帧缓冲失败: " + std::string(strerror(errno));
+        ::close(shmFd);
+        shmFd = -1;
+        return false;
+    }
+    shmMap = m;
+    return true;
+}
+
 } // namespace
 
 bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
@@ -900,7 +961,7 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
     if (!audio_.open(opt, info, err))
         return false;
 
-    const size_t want = opt.cpuWorkers > 0 ? static_cast<size_t>(opt.cpuWorkers) : 8;
+    const size_t want = opt.cpuWorkers > 0 ? static_cast<size_t>(opt.cpuWorkers) : 3;  // 防御值（CPU 路径下必已被调度块解析）
     const size_t n = frames == 0 ? 1 : (frames < want ? frames : want);
     nWorkers_ = n;
     start_ = opt.workerStart > 0 ? static_cast<size_t>(opt.workerStart) : 0;
@@ -914,12 +975,33 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
     received_.assign(nWorkers_, 0);
 
     for (size_t k = 0; k < nWorkers_; ++k) {
+        // 每 worker：共享帧缓冲（memfd 双槽）+ 确认管道（父→worker）
+        Worker w;
+        if (!createShmSlots(frameSize_, w.shmFd, w.shmMap, err))
+            return false;
+        w.slotSize = frameSize_ + kFrameGuard;
+        int ackPipe[2];
+        if (pipe(ackPipe) != 0) {
+            err = "确认管道创建失败: " + std::string(strerror(errno));
+            ::close(w.shmFd);
+            munmap(w.shmMap, w.slotSize * kShmSlots);
+            return false;
+        }
+        fcntl(ackPipe[0], F_SETFD, FD_CLOEXEC);
+        fcntl(ackPipe[1], F_SETFD, FD_CLOEXEC);
+        w.ackFd = ackPipe[1];
+
         int readFd = -1;
         pid_t pid = -1;
-        if (!spawnWorkerProc(opt, k, nWorkers_, frames, start_, readFd, pid,
-                             err))
+        if (!spawnWorkerProc(opt, k, nWorkers_, frames, start_, w.shmFd,
+                             ackPipe[0], readFd, pid, err)) {
+            ::close(ackPipe[0]);
+            ::close(w.ackFd);
+            ::close(w.shmFd);
+            munmap(w.shmMap, w.slotSize * kShmSlots);
             return false;
-        Worker w;
+        }
+        ::close(ackPipe[0]);
         w.fd = readFd;
         w.pid = pid;
         workers_.push_back(w);
@@ -941,22 +1023,39 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
 bool CpuAsyncDecoderImpl::respawnWorker(size_t idx, size_t nextStart,
                                         std::string& err)
 {
+    // 新一代沿用同一共享帧缓冲（memfd 属父进程，代际间不重建），
+    // 确认管道每代新建（旧一代的读端随进程退出关闭）。
+    Worker& w = workers_[idx];
+    int ackPipe[2];
+    if (pipe(ackPipe) != 0) {
+        err = "确认管道创建失败: " + std::string(strerror(errno));
+        return false;
+    }
+    fcntl(ackPipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(ackPipe[1], F_SETFD, FD_CLOEXEC);
+
     int readFd = -1;
     pid_t pid = -1;
     if (!spawnWorkerProc(opt_, idx, nWorkers_, frames_, nextStart - idx,
-                         readFd, pid, err)) {
+                         w.shmFd, ackPipe[0], readFd, pid, err)) {
+        ::close(ackPipe[0]);
+        ::close(ackPipe[1]);
         err = "worker respawn 失败: " + err;
         return false;
     }
-    // 替换管道读端与 PID，并更新信号槽（找到旧 PID 则原位替换）。
+    ::close(ackPipe[0]);
+    // 替换控制管道读端、确认管道写端与 PID，并更新信号槽。
     // 调用方（EOF 分支）已在 SIGINT/SIGTERM 屏蔽临界区内收殓旧 pid。
-    const pid_t oldPid = workers_[idx].pid;
-    if (workers_[idx].fd >= 0)
-        ::close(workers_[idx].fd);
-    workers_[idx].fd = readFd;
-    workers_[idx].pid = pid;
-    workers_[idx].dead = false;
-    workers_[idx].exitDetail.clear();
+    const pid_t oldPid = w.pid;
+    if (w.fd >= 0)
+        ::close(w.fd);
+    if (w.ackFd >= 0)
+        ::close(w.ackFd);
+    w.fd = readFd;
+    w.ackFd = ackPipe[1];
+    w.pid = pid;
+    w.dead = false;
+    w.exitDetail.clear();
     bool slotSet = false;
     for (volatile sig_atomic_t i = 0;
          i < nraw::g_workerPidCount && i < kMaxWorkerSlots; ++i) {
@@ -1081,7 +1180,7 @@ bool CpuAsyncDecoderImpl::readWorkerFrame(size_t idx, std::string& err)
 {
     Worker& w = workers_[idx];
     uint64_t no = 0;
-    uint32_t sz = 0;
+    uint32_t slot = 0;
     ssize_t hr = readFull(w.fd, &no, sizeof(no));
     if (hr == 0) {  // 该 worker 写端已关闭
         // 正常批次完成 → 代际回收重启下一批；异常提前退出 → 失败。
@@ -1139,15 +1238,16 @@ bool CpuAsyncDecoderImpl::readWorkerFrame(size_t idx, std::string& err)
         return true;
     }
     if (hr < 0 || hr != static_cast<ssize_t>(sizeof(no)) ||
-        readFull(w.fd, &sz, sizeof(sz)) != static_cast<ssize_t>(sizeof(sz))) {
+        readFull(w.fd, &slot, sizeof(slot)) !=
+            static_cast<ssize_t>(sizeof(slot))) {
         markDead(idx);
-        err = "读取 worker 帧头失败 (worker " + std::to_string(idx) + ")";
+        err = "读取 worker 填充记录失败 (worker " + std::to_string(idx) + ")";
         return false;
     }
-    if (sz != frameSize_) {
+    if (slot >= kShmSlots) {
         markDead(idx);
-        err = "worker 帧大小不符 (" + std::to_string(sz) + " != " +
-              std::to_string(frameSize_) + ")";
+        err = "worker 槽位号非法 (" + std::to_string(slot) + " >= " +
+              std::to_string(kShmSlots) + ")";
         return false;
     }
     // 校验帧号 = 该 worker 应产出的下一帧（start_ + idx + 已收帧数×nWorkers_，模分布）：
@@ -1184,11 +1284,21 @@ bool CpuAsyncDecoderImpl::readWorkerFrame(size_t idx, std::string& err)
               " 的帧 " + std::to_string(no);
         return false;
     }
-    if (readFull(w.fd, f.rgb.data(), frameSize_) !=
-        static_cast<ssize_t>(frameSize_)) {
-        markDead(idx);
-        err = "读取 worker 帧数据失败 (worker " + std::to_string(idx) + ")";
-        return false;
+    // 从共享帧缓冲重排：Interleaved (RGBRGB...) → Planar (RRR...GGG...BBB)
+    // 管道确认/填充记录的内存序保证槽内容已就绪。
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(
+        static_cast<uint8_t*>(w.shmMap) + static_cast<size_t>(slot) * w.slotSize);
+    uint16_t* dst = static_cast<uint16_t*>(f.rgb.data());
+    const size_t n = width_ * height_;
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = src[3 * i];
+        dst[n + i] = src[3 * i + 1];
+        dst[2 * n + i] = src[3 * i + 2];
+    }
+    // 槽释放确认（EPIPE = worker 已退出/新一代接管，忽略）
+    {
+        ssize_t aw = write(w.ackFd, &slot, sizeof(slot));
+        (void)aw;
     }
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -1251,6 +1361,18 @@ void CpuAsyncDecoderImpl::close()
             if (w.fd >= 0) {
                 ::close(w.fd);
                 w.fd = -1;
+            }
+            if (w.ackFd >= 0) {
+                ::close(w.ackFd);
+                w.ackFd = -1;
+            }
+            if (w.shmMap) {
+                munmap(w.shmMap, w.slotSize * kShmSlots);
+                w.shmMap = nullptr;
+            }
+            if (w.shmFd >= 0) {
+                ::close(w.shmFd);
+                w.shmFd = -1;
             }
             if (w.pid > 0)
                 pids.push_back(w.pid);
@@ -1347,15 +1469,6 @@ int runDecodeWorker(const CliOptions& opt)
                 err.c_str());
         return 1;
     }
-    SequentialDecoder dec;
-    if (!dec.open(opt, info, err)) {
-        fprintf(stderr, "worker %ld: 解码器打开失败: %s\n", opt.workerId,
-                err.c_str());
-        return 1;
-    }
-    // 释放 openMedia 建立的全局 gClip（元数据已入 gInfo，解码用 dec 的
-    // clip_）：worker 不再持有冗余双 Clip，基线 RSS 可降 ~2GB。
-    releaseGlobalClip();
 
     const size_t total = static_cast<size_t>(opt.workerFrames);
     const size_t start = opt.workerStart > 0
@@ -1364,38 +1477,88 @@ int runDecodeWorker(const CliOptions& opt)
     const size_t id = static_cast<size_t>(opt.workerId);
     const size_t n = static_cast<size_t>(opt.workerCount);
     const size_t frameSize = info.width * info.height * 6;
-    const int outFd = 3;
+    const size_t slotSize = frameSize + kFrameGuard;
+
+    // ---- 共享帧缓冲协议 ----
+    // fd 4 = memfd（父进程创建，MAP_SHARED 双槽）；fd 5 = 确认管道读端。
+    // SDK 直接解码进槽（Interleaved），父进程从共享内存重排并确认——
+    // 免去每帧 115MB 的管道双向拷贝，解码下一帧与消费当前帧完全重叠。
+    struct stat shmSt;
+    if (fstat(kShmFd, &shmSt) != 0 || shmSt.st_size <= 0) {
+        fprintf(stderr, "worker %ld: 共享帧缓冲 fd 无效\n", opt.workerId);
+        return 1;
+    }
+    const size_t nSlots = static_cast<size_t>(shmSt.st_size) / slotSize;
+    if (nSlots < kShmSlots || shmSt.st_size % slotSize != 0) {
+        fprintf(stderr,
+                "worker %ld: 共享帧缓冲尺寸异常 (%lld / %zu)\n",
+                opt.workerId, static_cast<long long>(shmSt.st_size), slotSize);
+        return 1;
+    }
+    void* shm = mmap(nullptr, static_cast<size_t>(shmSt.st_size),
+                     PROT_READ | PROT_WRITE, MAP_SHARED, kShmFd, 0);
+    if (shm == MAP_FAILED) {
+        fprintf(stderr, "worker %ld: mmap 共享帧缓冲失败: %s\n", opt.workerId,
+                strerror(errno));
+        return 1;
+    }
 
     // 模分布解码：本 worker 解码 帧号 ≡ id (mod n)（REDCODE 帧内压缩，
-    // 任意帧号可直接解码）。fr 提到循环外复用缓冲（每帧 57.5MB 新建/
-    // 释放是 mmap 抖动，压力下分配失败→worker 退出）
-    VideoFrame fr;
-    // 内存说明：曾在此按 RSS 预算触发 FinalizeSdk 重建、周期 CloseFileHandles
-    // 等缓解 SDK 逐帧内存增长——实测重建仅回收 ~0.2GB 且基线持续抬升（无效）。
-    // 根因有二，均已修复：
-    //  1) SDK PixelType_16Bit_RGB_Planar 路径逐帧泄漏 ~1MB 匿名内存
-    //     → decodeFrame 改用 Interleaved 解码 + 应用内重排（输出逐位一致）。
-    //  2) SDK 解码路径存在 FinalizeSdk 无法回收的内存积累 → 代际回收：
-    //     本进程每代只解码 --worker-batch 帧后干净退出，由父进程 spawn
-    //     下一批（进程退出即归还全部内存，峰值与泄漏速率无关）。
+    // 任意帧号可直接解码）。每代只解码 --worker-batch 帧后干净退出——
+    // SDK 解码路径存在 FinalizeSdk 无法回收的内存积累，进程退出即归还
+    // 全部内存（代际回收，峰值与泄漏速率无关）。
     const size_t batch = static_cast<size_t>(opt.workerBatch);  // parseArgs 保证 ≥1
+    uint32_t pendingAck[kShmSlots] = {0, 0};
     size_t i = 0;
     for (size_t f = start + id; f < total && i < batch; f += n, ++i) {
-        if (!dec.decodeFrame(f, fr, err)) {
-            fprintf(stderr, "worker %ld: 解码失败: %s\n", opt.workerId,
-                    err.c_str());
+        const uint32_t s = static_cast<uint32_t>(i % kShmSlots);
+        // 等待该槽被父进程确认释放（阻塞读确认；父进程退出 → EOF → 退出）
+        while (pendingAck[s] > 0) {
+            uint32_t ackSlot = 0;
+            const ssize_t r = read(kAckFd, &ackSlot, sizeof(ackSlot));
+            if (r == 0)
+                return 1;  // 父进程已退出
+            if (r < 0 && errno == EINTR)
+                continue;
+            if (r == static_cast<ssize_t>(sizeof(ackSlot)) &&
+                ackSlot < kShmSlots)
+                --pendingAck[ackSlot];
+        }
+        uint8_t* slot = static_cast<uint8_t*>(shm) +
+                        static_cast<size_t>(s) * slotSize;
+        // SDK 直接解码进共享槽（Interleaved；哨兵校验行填充越界）
+        uint8_t* const sentinel = slot + frameSize;
+        const uint64_t sentinelVal = 0xA55A5AA55AA55A5AULL;
+        memcpy(sentinel, &sentinelVal, sizeof(sentinelVal));
+        R3DSDK::VideoDecodeJob job;
+        job.Mode = R3DSDK::DECODE_FULL_RES_PREMIUM;
+        job.PixelType = R3DSDK::PixelType_16Bit_RGB_Interleaved;
+        job.OutputBuffer = slot;
+        job.OutputBufferSize = static_cast<uint64_t>(slotSize);
+        job.ImageProcessing = gIp;
+        job.HdrProcessing = nullptr;
+        job.OutputFrameMetadata = nullptr;
+        const R3DSDK::DecodeStatus dst = gClip->DecodeVideoFrame(f, job);
+        if (dst != R3DSDK::DSDecodeOK) {
+            fprintf(stderr, "worker %ld: 解码失败 frame %zu (status %d)\n",
+                    opt.workerId, f, static_cast<int>(dst));
             return 1;
         }
+        if (memcmp(sentinel, &sentinelVal, sizeof(sentinelVal)) != 0) {
+            fprintf(stderr,
+                    "[SDK越界] frame %zu: RED SDK 写越过了 w*h*6 缓冲边界 "
+                    "(需增大余量或按 SDK 要求对齐)\n",
+                    f);
+        }
+        // 填充记录 [u64 frameNo][u32 slotIdx] → 父进程
         const uint64_t no = static_cast<uint64_t>(f);
-        const uint32_t sz = static_cast<uint32_t>(frameSize);
-        if (writeFull(outFd, &no, sizeof(no)) < 0 ||
-            writeFull(outFd, &sz, sizeof(sz)) < 0 ||
-            writeFull(outFd, fr.rgb.data(), frameSize) < 0) {
+        if (writeFull(kWorkerOutFd, &no, sizeof(no)) < 0 ||
+            writeFull(kWorkerOutFd, &s, sizeof(s)) < 0) {
             // 父进程已退出（管道关闭）
             return 1;
         }
+        ++pendingAck[s];
     }
-    dec.close();
     closeMedia();
     shutdownSdk();
     return 0;
