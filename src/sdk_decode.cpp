@@ -46,6 +46,25 @@ constexpr int kAckFd = 5;
 constexpr size_t kShmSlots = 2;
 constexpr size_t kFrameGuard = 65536;  // SDK 行填充余量（哨兵校验用）
 
+// 协议 fd 安全下限：子进程内 dup2 目标为 3/4/5，任何协议源 fd 若恰好
+// 等于这些值会被先执行的 dup2 覆盖。实测故障：代际重生时 ack 管道读端
+// 落在 4 → 被 dup2(shmFd→4) 覆盖 → worker 从 memfd 读"确认"直至 EOF，
+// 静默退出（exit 1，无任何错误输出）；fd 表随代际演化，故仅特定代数
+// （两任务同时）触发。所有协议 fd 在 spawn 前统一搬迁到 ≥ kSafeFdMin。
+constexpr int kSafeFdMin = 10;
+
+// 把 fd 搬迁到 ≥ kSafeFdMin 的新编号（原编号关闭并复用失败时原样返回）
+static int liftFd(int fd)
+{
+    if (fd < kSafeFdMin) {
+        const int nfd = fcntl(fd, F_DUPFD, kSafeFdMin);
+        if (nfd >= 0) {
+            ::close(fd);
+            return nfd;
+        }
+    }
+    return fd;
+}
 
 }  // namespace
 
@@ -841,18 +860,15 @@ static bool spawnWorkerProc(const CliOptions& opt, size_t id, size_t count,
         err = "pipe 创建失败: " + std::string(strerror(errno));
         return false;
     }
-    for (int k = 0; k < 2; ++k) {
-        if (fds[k] == 3) {
-            const int nfd = fcntl(fds[k], F_DUPFD_CLOEXEC, 10);
-            if (nfd < 0) {
-                ::close(fds[0]);
-                ::close(fds[1]);
-                err = "管道 fd 搬迁失败: " + std::string(strerror(errno));
-                return false;
-            }
-            ::close(fds[k]);
-            fds[k] = nfd;
-        }
+    // 协议 fd 统一搬到安全区（见 liftFd 注释）：源 fd 与 dup2 目标 3/4/5
+    // 同值会被覆盖，导致 worker 协议通道错位（实测静默退出）。
+    fds[0] = liftFd(fds[0]);
+    fds[1] = liftFd(fds[1]);
+    if (fds[0] < kSafeFdMin || fds[1] < kSafeFdMin) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        err = "管道 fd 搬迁失败: " + std::string(strerror(errno));
+        return false;
     }
     fcntl(fds[0], F_SETFD, FD_CLOEXEC);
     fcntl(fds[1], F_SETFD, FD_CLOEXEC);
@@ -979,6 +995,7 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
         Worker w;
         if (!createShmSlots(frameSize_, w.shmFd, w.shmMap, err))
             return false;
+        w.shmFd = liftFd(w.shmFd);  // 协议 fd 搬到安全区（防 dup2 目标冲突）
         w.slotSize = frameSize_ + kFrameGuard;
         int ackPipe[2];
         if (pipe(ackPipe) != 0) {
@@ -987,6 +1004,7 @@ bool CpuAsyncDecoderImpl::open(const CliOptions& opt, const MediaInfo& info,
             munmap(w.shmMap, w.slotSize * kShmSlots);
             return false;
         }
+        ackPipe[0] = liftFd(ackPipe[0]);  // 同上（respawn 处同款保护）
         fcntl(ackPipe[0], F_SETFD, FD_CLOEXEC);
         fcntl(ackPipe[1], F_SETFD, FD_CLOEXEC);
         w.ackFd = ackPipe[1];
@@ -1033,6 +1051,7 @@ bool CpuAsyncDecoderImpl::respawnWorker(size_t idx, size_t nextStart,
     }
     fcntl(ackPipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(ackPipe[1], F_SETFD, FD_CLOEXEC);
+    ackPipe[0] = liftFd(ackPipe[0]);  // 协议 fd 搬到安全区（防 dup2 目标冲突）
 
     int readFd = -1;
     pid_t pid = -1;
